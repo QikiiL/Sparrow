@@ -1,6 +1,6 @@
 [package]
 name = "sparrow"
-version = "2.0.0"
+version = "2.1.0"
 description = "A clipboard manager built with Tauri"
 authors = ["you"]
 license = "MIT"
@@ -38,7 +38,19 @@ arboard = "3"
 image = "0.25"
 clipboard-win = "5"
 base64 = "0.22"
+# 云同步(WebDAV / S3):端到端加密 + 对象存储适配。
+# 全部纯 Rust 实现,不引系统库:keyring 走 Windows 原生 Credential Manager
+# (windows-native feature),aes-gcm/argon2 均为 RustCrypto 实现。
+aes-gcm = "0.10"
+argon2 = "0.5"
+hmac = "0.12"
+quick-xml = "0.39"
+rand = "0.8"
+uuid = { version = "1", features = ["v4"] }
+keyring = { version = "3", features = ["windows-native"] }
 ureq = { version = "2", default-features = false, features = ["tls", "json"] }
+# WebDAV / S3 后端的 URL 拼装与 SigV4 规范化(ureq 已传递依赖 url,这里只是直接引用)
+url = "2"
 winreg = "0.52"
 regex = "1"
 webview2-com = "0.38"
@@ -64,3 +76,7 @@ windows = { version = "0.61", features = [
   "Win32_System_Com",
   "Win32_UI_Shell",
 ] }
+
+[dev-dependencies]
+# WebDAV / S3 后端测试用本地 HTTP mock(不需要外网,也不碰真实存储)
+httpmock = "0.7"

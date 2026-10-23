@@ -55,6 +55,10 @@ pub struct AppSettings {
     // 通知访问权限,由设置面板引导完成后再真正启用轮询
     #[serde(default)]
     pub sms_code_enabled: bool,
+    // 云同步配置。整对象覆盖写(前端 save_settings 回传全量对象),
+    // 缺省安全:旧版 settings.json 没有 sync 字段时回落 SyncSettings::default()
+    #[serde(default)]
+    pub sync: crate::models::sync::SyncSettings,
 }
 
 /// 窗口默认置顶;serde 的字段级 default 若不指定函数,bool 恒为 false,
@@ -104,6 +108,7 @@ impl Default for AppSettings {
             detect_sensitive: true,
             excluded_allowlist: Vec::new(),
             sms_code_enabled: false,
+            sync: crate::models::sync::SyncSettings::default(),
         }
     }
 }
@@ -166,6 +171,18 @@ mod tests {
         let json = serde_json::to_string(&settings).unwrap();
         let deserialized: AppSettings = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.retention_days, settings.retention_days);
+    }
+
+    /// 旧版 settings.json 里没有 sync 字段(或前端回传的对象漏了这个字段):
+    /// 反序列化必须回落默认值,不能让整份设置读取失败。
+    #[test]
+    fn missing_sync_field_uses_default() {
+        let mut value = serde_json::to_value(AppSettings::default()).unwrap();
+        value.as_object_mut().unwrap().remove("sync");
+        let settings: AppSettings = serde_json::from_value(value).unwrap();
+        assert!(!settings.sync.enabled);
+        assert_eq!(settings.sync.root_prefix, "sparrow");
+        assert_eq!(settings.sync.poll_interval_sec, 5);
     }
 
     #[test]

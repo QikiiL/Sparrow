@@ -3,6 +3,7 @@ import { listen } from '@tauri-apps/api/event';
 import { invoke } from '@tauri-apps/api/core';
 import { getVersion } from '@tauri-apps/api/app';
 import { useClipboardStore } from '../stores/clipboardStore';
+import { useSyncStatus } from '../hooks/useSyncStatus';
 import { queryItems } from '../lib/db';
 import { formatBytes } from '../lib/format';
 import { ArrowUpIcon } from './icons';
@@ -34,6 +35,8 @@ export function StatusBar() {
   const smsSeq = useRef(0);
   const totalCount = items.length;
   const favoriteCount = useMemo(() => items.filter((i) => i.is_favorite).length, [items]);
+  // 云同步状态:靠后端 sync-status 事件推送,不轮询;未启用时不显示
+  const syncStatus = useSyncStatus();
 
   useEffect(() => {
     getVersion().then(setAppVersion).catch(() => {});
@@ -189,6 +192,23 @@ export function StatusBar() {
           />
           <span>{isPaused ? '已暂停' : '监听中'}</span>
         </div>
+        {syncStatus && syncStatus.state !== 'disabled' && (
+          // 云同步状态点:disabled 不渲染(没开同步的用户不该看到多余的点)
+          <div className="flex items-center whitespace-nowrap">
+            <span
+              role="img"
+              aria-label="云同步状态"
+              className={`w-1.5 h-1.5 rounded-full ${
+                syncStatus.state === 'syncing'
+                  ? 'bg-accent motion-safe:animate-pulse'
+                  : syncStatus.state === 'error'
+                    ? 'bg-danger'
+                    : 'bg-ok'
+              }`}
+              title={syncStatus.last_error || '已同步'}
+            />
+          </div>
+        )}
       </div>
 
       {/* 两类提示共用同一个居中容器 —— 这点很关键:若各自 fixed inset-0

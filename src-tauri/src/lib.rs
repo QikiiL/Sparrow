@@ -219,9 +219,19 @@ pub fn run() {
             app.manage(monitor.clone());
             services::clipboard_monitor::ClipboardMonitor::start_polling(
                 app.handle().clone(),
-                db,
+                db.clone(),
                 monitor,
             );
+
+            // 云同步:轮询循环 + 运行句柄。start 只 spawn,不做网络 IO,
+            // 配置缺失/凭证缺失都只体现为同步状态 error,绝不影响应用启动。
+            // 命令层(get_sync_status/sync_now/...)与设置保存都通过这个句柄。
+            let sync_handle = services::sync::service::start(
+                app.handle().clone(),
+                db.clone(),
+                app_config_dir(),
+            );
+            app.manage(sync_handle);
 
             // 短信验证码捕获:轮询通知中心(TeleLink 同款路径)。线程常驻,
             // 靠 ENABLED 原子开关决定每轮是否真正读通知,关闭时零开销
@@ -363,6 +373,11 @@ pub fn run() {
             commands::settings::load_settings,
             commands::settings::allow_excluded_item,
             commands::settings::set_keep_open,
+            commands::sync::get_sync_status,
+            commands::sync::sync_now,
+            commands::sync::set_sync_secret,
+            commands::sync::has_sync_secrets,
+            commands::sync::test_sync_connection,
             commands::sms_code::sms_code_status,
             commands::sms_code::sms_code_request_access,
             commands::sms_code::open_notification_settings,

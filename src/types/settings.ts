@@ -1,3 +1,5 @@
+import type { SyncSettings } from './sync';
+
 export type CloseBehavior = 'ask' | 'minimize' | 'close';
 
 export interface AppSettings {
@@ -22,6 +24,8 @@ export interface AppSettings {
   excluded_allowlist: string[];
   // 短信验证码自动捕获(默认关闭,开启需授予系统通知访问权限)
   sms_code_enabled: boolean;
+  // 云同步(WebDAV / S3)。口令与密钥不进这里,走 Windows 凭据管理器
+  sync: SyncSettings;
 }
 
 export const DEFAULT_SETTINGS: AppSettings = {
@@ -42,4 +46,20 @@ export const DEFAULT_SETTINGS: AppSettings = {
   detect_sensitive: true,
   excluded_allowlist: [],
   sms_code_enabled: false,
+  sync: {
+    enabled: false,
+    provider: 'webdav',
+    webdav_url: '',
+    username: '',
+    s3_endpoint: '',
+    s3_region: '',
+    s3_bucket: '',
+    s3_access_key: '',
+    s3_path_style: false,
+    root_prefix: 'sparrow',
+    poll_interval_sec: 5,
+    device_name: '',
+    sync_images: true,
+    max_blob_mb: 20,
+  },
 };
