@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import type { AppSettings } from '../types/settings';
 import type {
+  SyncMode,
   SyncProvider,
   SyncSecretField,
   SyncSecretsPresence,
@@ -33,6 +34,12 @@ import {
 const PROVIDERS: { value: SyncProvider; label: string }[] = [
   { value: 'webdav', label: 'WebDAV' },
   { value: 's3', label: 'S3 兼容' },
+];
+
+/** 同步方式:轮询(默认) / 仅启动时(启动跑一轮后静默) */
+const MODES: { value: SyncMode; label: string }[] = [
+  { value: 'interval', label: '按间隔轮询' },
+  { value: 'startup', label: '仅启动时' },
 ];
 
 const MIN_POLL = 2;
@@ -332,6 +339,11 @@ export function SyncSection({ settings, saveNow }: Props) {
               <span className="max-w-[180px] truncate">{statusText}</span>
             </div>
           </div>
+          {status?.warning ? (
+            <p className="mt-1.5 text-[11px] leading-relaxed text-warn">
+              {status.warning}（对端可能关闭了图片同步，或文件超过大小上限）
+            </p>
+          ) : null}
         </div>
 
         <Row title="启用云同步" desc="关闭后不再上传与拉取，本地历史不受影响">
@@ -341,6 +353,22 @@ export function SyncSection({ settings, saveNow }: Props) {
             label="启用云同步"
           />
         </Row>
+
+        <div className="px-3.5 py-[11px]">
+          <div className="text-[12.5px] font-medium">同步方式</div>
+          <div className="mt-2">
+            <Segmented
+              value={s.sync_mode}
+              options={MODES}
+              onChange={(v) => patch({ sync_mode: v })}
+            />
+          </div>
+          {s.sync_mode === 'startup' && (
+            <p className="mt-1.5 text-[11px] leading-relaxed text-faint">
+              启动时同步一次，之后不轮询；复制/删除不会触发同步，点「立即同步」可手动拉取。
+            </p>
+          )}
+        </div>
 
         <div className="px-3.5 py-[11px]">
           <div className="text-[12.5px] font-medium">存储后端</div>
@@ -424,15 +452,17 @@ export function SyncSection({ settings, saveNow }: Props) {
           </div>
         )}
 
-        <Row title="轮询间隔" desc={`${MIN_POLL}–${MAX_POLL} 秒；越小越实时，也越费流量`}>
-          <Stepper
-            value={poll}
-            min={MIN_POLL}
-            ariaLabel="轮询间隔"
-            onChange={setPollDraft}
-            onCommit={commitPoll}
-          />
-        </Row>
+        {s.sync_mode !== 'startup' && (
+          <Row title="轮询间隔" desc={`${MIN_POLL}–${MAX_POLL} 秒；越小越实时，也越费流量`}>
+            <Stepper
+              value={poll}
+              min={MIN_POLL}
+              ariaLabel="轮询间隔"
+              onChange={setPollDraft}
+              onCommit={commitPoll}
+            />
+          </Row>
+        )}
 
         <div className="px-3.5 py-[11px] space-y-2.5">
           <TextField

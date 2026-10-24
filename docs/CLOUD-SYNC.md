@@ -84,14 +84,15 @@
 | `s3_access_key` | string | `""` | Access Key ID（**只有 ID**，secret 不在这里） |
 | `s3_path_style` | bool | `false` | `true` = `{endpoint}/{bucket}/...`；`false` = `{bucket}.{host}/...` |
 | `root_prefix` | string | `"sparrow"` | 远端根前缀，去掉首尾空白与 `/`；为空时回落 `sparrow` |
-| `poll_interval_sec` | u32 | `5` | 轮询间隔秒。代码夹到 **2–300**；出错后下一轮取 `max(间隔, 30s)` |
+| `poll_interval_sec` | u32 | `5` | 轮询间隔秒。代码夹到 **2–300**；出错后下一轮取 `max(间隔, 30s)`。`sync_mode = "startup"` 时该字段不生效 |
+| `sync_mode` | `"interval"` \| `"startup"` | `"interval"` | 同步方式。`interval` = 按 `poll_interval_sec` 轮询；`startup` = 启动跑一轮后**不轮询**，见 6.3 |
 | `device_name` | string | `COMPUTERNAME`，取不到为 `"device"` | 设置面板里的「设备名」会写进每次上传的快照（`Snapshot.device_name`），用来在别的设备上认出这条快照；**不是**设备标识（设备标识是 `device_id`）。改设备名只影响展示，不影响快照摘要，因此不会触发额外上传 |
 | `sync_images` | bool | `true` | 是否同步图片；关闭后快照里跳过 `type=2` |
 | `max_blob_mb` | u32 | `20` | 单张图片上限（MB），超限的图片被跳过并记一行日志 |
 
 补充说明：
 
-- **设置面板暴露的项**：`enabled`、`provider`、`webdav_url`、`username`、WebDAV 密码、`s3_endpoint`、`s3_region`、`s3_bucket`、`s3_access_key`、S3 Secret Key、`s3_path_style`、`poll_interval_sec`、`device_name`、`root_prefix`、`sync_images`、同步口令。
+- **设置面板暴露的项**：`enabled`、`sync_mode`、`provider`、`webdav_url`、`username`、WebDAV 密码、`s3_endpoint`、`s3_region`、`s3_bucket`、`s3_access_key`、S3 Secret Key、`s3_path_style`、`poll_interval_sec`（仅 `interval` 模式显示）、`device_name`、`root_prefix`、`sync_images`、同步口令。
 - **`max_blob_mb` 不在界面里**，只能手改 `settings.json`；改完需要重启应用（轮询循环持有的是内存副本，只有设置面板保存才会替换）。
 - 真正的设备标识是 `device_id`（UUID v4），自动生成，存在 `config/sync-state.json`，与 `device_name` 无关。
 
@@ -146,12 +147,12 @@ AAD 的作用：把 A 对象的密文挪到 B 对象上会解密失败，避免�
 
 | 存储方能看到 | 存储方看不到 |
 |---|---|
-| 对象名（`root_prefix`、设备 UUID、图片 `content_hash`） | 条目文本、链接原文、预览 |
+| 对象名（`root_prefix`、设备 UUID、图片/富文本的 `content_hash`） | 条目文本、链接原文、预览 |
 | 对象大小、修改时间、ETag | 条目创建/使用时间戳 |
 | `meta.json` 的 KDF 参数、salt 与 `check` 校验值 | 设备名（在密文快照里） |
-| 请求频率（即同步活跃度） | 图片内容、图片数量与内容之间的关联 |
+| 请求频率（即同步活跃度） | 图片内容、富文本内容、数量与内容之间的关联 |
 
-说明：图片是**内容寻址**的，`blobs/{hash}.bin` 里的 hash 是明文图片内容的哈希。若攻击者已经猜到某张图片的确切内容，可以据此确认它是否在远端 —— 这是内容寻址的固有权衡。
+说明：图片与富文本副本都是**内容寻址**的，`blobs/{hash}.bin` 里的 hash 是明文字节（图片 / CF_HTML / RTF）的哈希。若攻击者已经猜到某份内容的确切字节，可以据此确认它是否在远端 —— 这是内容寻址的固有权衡。
 
 ### 5.4 日志脱敏
 
@@ -185,7 +186,7 @@ AAD 的作用：把 A 对象的密文挪到 B 对象上会解密失败，避免�
 ```
 {root_prefix}/meta.json                 # 明文：KDF 参数 + salt + check 校验值
 {root_prefix}/devices/{deviceId}.json   # 密文：本设备全量快照（含墓碑）
-{root_prefix}/blobs/{contentHash}.bin   # 密文：图片，内容寻址
+{root_prefix}/blobs/{contentHash}.bin   # 密文：图片 / 富文本副本（HTML、RTF），内容寻址
 {root_prefix}/.probe-{uuid}             # 测试连接的临时对象（用完即删）
 ```
 
@@ -195,7 +196,7 @@ AAD 的作用：把 A 对象的密文挪到 B 对象上会解密失败，避免�
 ### 6.2 快照与合并
 
 - 每台设备上传的是**全量快照** `Snapshot { v, device_id, device_name, generated_at, records[] }`，不传增量。
-- 每条记录 `SyncRecord { hash, kind, content, preview, created_at, updated_at, deleted_at, blob_size }`；`kind`：`0` 文本 / `1` 链接 / `2` 图片。
+- 每条记录 `SyncRecord { hash, kind, content, preview, created_at, updated_at, deleted_at, blob_size, html_blob, html_size, rtf_blob, rtf_size }`；`kind`：`0` 文本 / `1` 链接 / `2` 图片。快照格式版本 `v = 2`（v1 没有后四个字段；旧 peer 读到 v2 快照会忽略它们，只同步纯文本）。
 - 拉取时按 ETag 判断：`devices/` 下 ETag 与本机记录相同的 peer 直接跳过，不 GET。
 - **LWW**：同一 `content_hash` 冲突时取 `updated_at`（= 本地 `last_used_at`）较大的那条。
 - **content_hash 去重**：本地已有同 hash 的条目时只更新 `last_used_at`，不重复插入。
@@ -203,11 +204,22 @@ AAD 的作用：把 A 对象的密文挪到 B 对象上会解密失败，避免�
 - 乐观并发：自己的快照用 `If-Match: 上次ETag`（首次用 `If-None-Match: *`），冲突时 HEAD 后重试一次，仍冲突则报「设备 ID 冲突」。
 - 拉取后**只写本地库**，不写系统剪贴板 —— 因此不会出现"同步回来的内容又被采集一次"的回环。
 
-### 6.3 轮询与重试
+### 6.3 同步方式、轮询与重试
 
-- 轮询间隔 = `poll_interval_sec` 夹到 **2–300 秒**，默认 5 秒；`sync_now`（「立即同步」）、配置保存、删除钩子，以及**本机复制入库**（`clipboard-changed` / `item-deleted` 事件）都会立即唤醒一轮（带去抖，且同步自己写库触发的事件被忽略，避免回环）。
-- 未启用：每 2 秒检查一次配置，无网络请求。
-- 失败后下一轮间隔取 `max(轮询间隔, 30 秒)`，成功后恢复。
+`sync_mode` 决定"下一轮什么时候跑"：
+
+| `sync_mode` | 定时器 | `clipboard-changed` / `item-deleted` | 唤醒来源 |
+| --- | --- | --- | --- |
+| `interval`（默认） | 每 `poll_interval_sec`（夹到 **2–300 秒**，默认 5 秒） | **立即唤醒**（400ms 去抖） | 定时器 + 事件 + 手动 + 保存设置 |
+| `startup` | **不设定时器** | **不唤醒** | 只有手动「立即同步」、保存设置、切换模式 |
+
+- **`startup`（仅启动时）**：进程启动后跑完一轮就静默，之后既不轮询也不响应本机复制/删除事件 —— 这是给"不想每 5 秒打扰存储服务"的场景准备的。
+  - 手动「立即同步」在两种模式下都可用，是 `startup` 模式下唯一的按需拉取方式。
+  - 删除墓碑（`item-deleted`）在 `startup` 模式下不会立刻上传：删除**立即**写入本地 `config/sync-tombstones.pending` 日志（一行一个 `{"hash":…,"deleted_at":…}`，纯本地写盘、不联网），等下一次启动或下一次手动同步的那一轮才合并进 `sync-state.json` 并让对端跟随删除。墓碑在删除瞬间就已落盘，**退出应用不会丢**：下次启动第一轮就会读回来，因此不会出现"本地已删、下次启动又从远端复活"。
+  - 出错（凭据缺失 / 网络失败）后**不自动重试**，等下一次手动同步或重启。
+- **`interval`**：`sync_now`（「立即同步」）、配置保存、删除钩子，以及**本机复制入库**（`clipboard-changed` / `item-deleted` 事件）都会立即唤醒一轮（带去抖，且同步自己写库触发的事件被忽略，避免回环）。
+- 未启用：每 2 秒检查一次配置，无网络请求（两种模式一致）。
+- 失败后下一轮间隔取 `max(轮询间隔, 30 秒)`，成功后恢复（仅 `interval` 模式会自动重试）。
 - 重试：`Network` / `Server` / HTTP 429 最多 3 次尝试，退避 500ms → 2s；`Auth` / `Config` 类错误不重试（**重定向 3xx 与 http 协议降级都算 `Config`**，重试无意义）。
 - 超时：连接 5s；元数据请求 20s；blob 传输 60s。
 
@@ -217,18 +229,33 @@ AAD 的作用：把 A 对象的密文挪到 B 对象上会解密失败，避免�
 - 接收方解密后写到 `data/images/{hash前16位}.png`（先写 `.tmp` 再 rename），再插库并带 `file_path`。
 - 超过 `max_blob_mb` 或本地文件缺失/读不到的图片，快照里直接跳过。
 
-### 6.5 删除
+### 6.5 富文本副本（HTML / RTF）
+
+文本/链接条目在本地可能带 `html_path` / `rtf_path`（CF_HTML 包装与 RTF 流的**原始字节**，落在 `data/formats/`）。同步时：
+
+- 快照里只带 `html_blob` / `html_size` / `rtf_blob` / `rtf_size`（blob = 原始字节的 sha256 hex，size = 字节数）；**绝不带本机绝对路径**。
+- 远端对象是 `blobs/{html_blob}.bin` / `blobs/{rtf_blob}.bin`，键是**内容** hash，与 `record.hash` 无关：同一份 html 被多个条目共享时只上传一次。
+- 上传前读文件并自校验 `sha256(bytes) == blob_hash`，不一致就跳过（下一轮快照重算会得到新 blob hash，自然重试）；读取后无条件 `PUT`（换口令必须覆盖旧密文，理由同图片）。
+- 接收方解密 → 再校验 sha256 与 `*_size` → 写到 `data/formats/{record.hash 前 16 位}.html|.rtf`（先 `.tmp` 再 rename）。**不用 blob hash 命名**：两个条目共享同一份字节时，按 blob hash 命名会让它们指向同一个文件，删掉一个就把另一个的格式文件带走。
+- 任一种格式的 blob 缺失/解密失败/超限 → 该列置 `NULL`、计入 `skipped_formats`，**纯文本照常插入**（降级为纯文本，不丢条目）。
+- 发送端文件缺失 / 0 字节 / 超过 `max_blob_mb` 同样计入 `skipped_formats`（HTML 与 RTF 独立计数），并通过 `SyncStatus.warning` 提示，例如「3 张图片、2 个富文本未同步」。
+- **不 sanitize、不解析**：RTF 的 `\bin` 段一旦被解析重构就会损坏；HTML 的净化在预览端（`get_rich_preview` + 前端 iframe `sandbox=""`）已经做过。
+- 威胁模型：所有设备共享同一口令，视为**同一信任域**；远端只有密文，故不在传输链路里做净化（净化会破坏无损往返）。信任域内某台设备若被攻陷，它本来就能读到明文，净化与否不影响结论。
+- 删除条目时同时删本地 `html_path` / `rtf_path` 指向的文件（与图片同源的 canonicalize + `starts_with` 守卫，目录外一律不碰）。
+
+### 6.6 删除
 
 - 只有**显式删除**（删除单条、清空历史）才产生墓碑：`content_hash` + `deleted_at`，随下一次快照上传，其它设备据此删除本地对应条目与图片文件。
 - **retention / 条数上限等自动清理不产生墓碑，也不传播**。B 上被 retention 清掉的条目，不会导致 A 上同一条被删；同理 B 手动收藏的条目不会因为 A 的自动清理而消失。
 - 墓碑保留 **60 天**（`TOMBSTONE_TTL_MS`），超期裁剪；`uploaded_blobs` 记录上限 **2000** 条（丢了只是多发一次 HEAD）。
 - 若某条目在墓碑之后又被使用（`updated_at > deleted_at`），视为"复活"，不再被墓碑压制。
 
-### 6.6 不同步的内容
+### 6.7 不同步的内容
 
 - 文件路径条目（`type = 3`）。
-- 富文本 HTML / RTF 副本（只同步纯文本、链接、图片）。
 - 收藏分组关系（收藏状态本身是本地概念，不传播）。
+
+（富文本 HTML / RTF 副本自快照 `v = 2` 起同步，见 6.5。）
 
 ---
 
@@ -242,8 +269,9 @@ AAD 的作用：把 A 对象的密文挪到 B 对象上会解密失败，避免�
 4. 填「口令」（同步口令），点保存 —— 写入凭据管理器 `Sparrow.Sync` / `passphrase`。两台设备用同一串。
 5. 填 WebDAV 密码 或 S3 Secret Key（失焦即保存）。
 6. 点「测试连接」。成功时返回 `连接成功 · N ms`（内部会 MKCOL 建目录、`PUT` 一个探测对象、读回校验、再 `DELETE` 掉）。探测对象的 key 是 **`{root_prefix}/.probe-{uuid}`** —— 命令层只传相对 key `.probe-{uuid}`，`{root_prefix}` 由后端拼；无论成功失败都会尝试删除，远端不会留下垃圾对象。
-7. 打开「启用云同步」。状态点应从 `disabled` 变为 `idle`，随后按轮询间隔周期性变成 `syncing`。
-8. 确认 `device_id` 已生成：打开 `<程序目录>\config\sync-state.json`，应能看到非空 `device_id`（UUID v4）。两台设备的 `device_id` **必须不同**（相同说明两个便携目录共用了同一份 `config/`）。
+7. 选「同步方式」：默认「按间隔轮询」（实时性最好，但会周期性请求存储服务）；若只想每次启动同步一次、平时完全静默，改选「**仅启动时**」——此时不再显示轮询间隔，复制/删除也不会触发同步，只能靠「立即同步」手动拉取。
+8. 打开「启用云同步」。状态点应从 `disabled` 变为 `idle`，随后（`interval` 模式）按轮询间隔周期性变成 `syncing`。
+9. 确认 `device_id` 已生成：打开 `<程序目录>\config\sync-state.json`，应能看到非空 `device_id`（UUID v4）。两台设备的 `device_id` **必须不同**（相同说明两个便携目录共用了同一份 `config/`）。
 
 ---
 

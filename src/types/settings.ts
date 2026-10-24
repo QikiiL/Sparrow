@@ -58,6 +58,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
     s3_path_style: false,
     root_prefix: 'sparrow',
     poll_interval_sec: 5,
+    sync_mode: 'interval',
     device_name: '',
     sync_images: true,
     max_blob_mb: 20,

@@ -443,6 +443,9 @@ impl Drop for TempDir {
 }
 
 /// 单连接内存库：内存库按连接隔离，必须锁死 1 个连接。
+///
+/// 001 只有基础列，`html_path`/`rtf_path` 由 003 追加（生产路径走
+/// `lib.rs::apply_rich_format_columns`）；测试直接照抄那两条 ALTER。
 async fn memory_pool() -> SqlitePool {
     let pool = sqlx::sqlite::SqlitePoolOptions::new()
         .max_connections(1)
@@ -453,6 +456,12 @@ async fn memory_pool() -> SqlitePool {
         .execute(&pool)
         .await
         .expect("建 items 表");
+    for ddl in [
+        "ALTER TABLE items ADD COLUMN html_path TEXT",
+        "ALTER TABLE items ADD COLUMN rtf_path TEXT",
+    ] {
+        sqlx::query(ddl).execute(&pool).await.expect("加富文本列");
+    }
     pool
 }
 
@@ -538,6 +547,7 @@ async fn make_ctx(server: &DavServer, dir: &Path, device_name: &str, key: [u8; 3
         settings: settings(server, device_name),
         state_path: dir.to_path_buf(),
         images_dir: dir.join("images"),
+        formats_dir: dir.join("formats"),
         emit: Box::new(|_status| {}),
     }
 }
@@ -552,6 +562,40 @@ async fn insert_text(db: &SqlitePool, content: &str, hash: &str) {
     .execute(db)
     .await
     .expect("插入文本条目");
+}
+
+/// 插入一条图片条目（`file_path` 是绝对路径，与真实采集路径一致）。
+async fn insert_image_row(db: &SqlitePool, hash: &str, file_path: &str) {
+    sqlx::query(
+        "INSERT INTO items (type, content, content_hash, file_path, preview)
+         VALUES (2, '[图片]', ?, ?, '[图片]')",
+    )
+    .bind(hash)
+    .bind(file_path)
+    .execute(db)
+    .await
+    .expect("插入图片条目");
+}
+
+/// 插入一条带富文本副本的文本条目（html/rtf 为绝对路径）。
+async fn insert_rich_text_row(
+    db: &SqlitePool,
+    hash: &str,
+    content: &str,
+    html_path: &Path,
+    rtf_path: &Path,
+) {
+    sqlx::query(
+        "INSERT INTO items (type, content, content_hash, preview, html_path, rtf_path)
+         VALUES (0, ?, ?, NULL, ?, ?)",
+    )
+    .bind(content)
+    .bind(hash)
+    .bind(html_path.to_string_lossy().to_string())
+    .bind(rtf_path.to_string_lossy().to_string())
+    .execute(db)
+    .await
+    .expect("插入富文本条目");
 }
 
 async fn count_hash(db: &SqlitePool, hash: &str) -> i64 {
@@ -865,4 +909,158 @@ async fn protocol_layer_covers_auth_and_all_methods() {
         vec!["blobs/y.bin".to_string()],
         "只剩一个对象"
     );
+}
+
+/// 7. 图片往返（真实 HTTP）：A 的 `type=2` 行 + 真实文件 → 加密 blob 上传 →
+/// B 下载解密落盘 → 字节逐字节一致；再跑一轮不重复插入。
+///
+/// 这是"文本同步正常、图片不同步"这个线上症状的回归测试：链路里任何一环
+/// （快照里的图片记录、blob 上传、blob 下载、落盘文件名）断掉都会变红。
+#[tokio::test]
+async fn image_round_trip_over_real_http() {
+    let server = DavServer::start();
+    let key = seeded_key(&server, "A");
+    let dir_a = TempDir::new("img-a");
+    let dir_b = TempDir::new("img-b");
+    let a = make_ctx(&server, dir_a.path(), "A", key).await;
+    let b = make_ctx(&server, dir_b.path(), "B", key).await;
+
+    // 假 PNG：代码只按字节搬运，不校验图片格式。hash = 32 字节内容的 sha256 hex
+    // （`insert_image` 要求 ≥32 位纯 hex，也顺带覆盖了 64 位真实 hash 的形态）。
+    let bytes: Vec<u8> = (0u8..32)
+        .map(|i| i.wrapping_mul(7).wrapping_add(3))
+        .collect();
+    let hash: String = Sha256::digest(&bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    assert_eq!(hash.len(), 64, "sha256 hex 应是 64 字符");
+
+    std::fs::create_dir_all(&a.images_dir).expect("建 A 的 images 目录");
+    let path_a = a.images_dir.join(format!("{}.png", &hash[..16]));
+    std::fs::write(&path_a, &bytes).expect("写 A 的图片文件");
+    insert_image_row(&a.db, &hash, &path_a.to_string_lossy()).await;
+
+    let ra = run_cycle(&a).await.expect("A 周期");
+    assert!(ra.uploaded, "A 应上传快照");
+    assert_eq!(ra.skipped_images, 0, "发送端不得丢图");
+    assert!(
+        server
+            .object(&dav_path(&format!("blobs/{hash}.bin")))
+            .is_some(),
+        "图片 blob 应已加密上传"
+    );
+
+    let rb = run_cycle(&b).await.expect("B 周期");
+    assert_eq!(rb.inserted, 1, "B 应插入图片条目");
+    assert_eq!(rb.skipped_images, 0, "B 不该跳过图片");
+
+    let row: Option<(String, String)> = sqlx::query_as(
+        "SELECT content, file_path FROM items WHERE content_hash = ? AND type = 2",
+    )
+    .bind(&hash)
+    .fetch_optional(&b.db)
+    .await
+    .expect("查 B 的图片行");
+    let (content, file_path) = row.expect("B 应有图片记录");
+    assert_eq!(content, "[图片]");
+
+    // file_path 必须落在 B 自己的 images 目录内（绝不能是 A 的绝对路径）
+    let b_images = std::fs::canonicalize(&b.images_dir).expect("规范化 B 的 images 目录");
+    let got_path = std::fs::canonicalize(&file_path).expect("B 的图片文件应已落盘");
+    assert!(
+        got_path.starts_with(&b_images),
+        "B 的 file_path 必须在 B 的 images 目录内"
+    );
+    assert_eq!(
+        std::fs::read(&got_path).expect("读回 B 的图片"),
+        bytes,
+        "图片字节必须与 A 完全一致"
+    );
+
+    // 再跑一轮：已有该行 → 不重复插入
+    let rb2 = run_cycle(&b).await.expect("B 第二轮");
+    assert_eq!(rb2.inserted, 0, "已存在不应重复插入");
+    assert_eq!(count_hash(&b.db, &hash).await, 1, "行数仍应是 1");
+}
+
+/// 8. 富文本往返（真实 HTTP）：A 一行文本 + formats 目录里的 html/rtf 原始字节
+/// → 加密 blob 上传（键是内容 hash）→ B 下载解密落盘 → 字节逐字节一致。
+#[tokio::test]
+async fn rich_text_round_trip_over_real_http() {
+    let server = DavServer::start();
+    let key = seeded_key(&server, "A");
+    let dir_a = TempDir::new("rich-a");
+    let dir_b = TempDir::new("rich-b");
+    let a = make_ctx(&server, dir_a.path(), "A", key).await;
+    let b = make_ctx(&server, dir_b.path(), "B", key).await;
+
+    // CF_HTML 包装（含中文正文）+ 带 \bin 段的 RTF：都必须原样搬运
+    let html: Vec<u8> =
+        b"Version:0.9\r\nStartHTML:0000000105\r\n<html><body>\xe4\xbd\xa0\xe5\xa5\xbd</body></html>"
+            .to_vec();
+    let rtf: Vec<u8> = b"{\\rtf1\\ansi\\bin4 abcd\\par hi}".to_vec();
+    // record.hash 是"文本 + 格式字节"的组合 hash（真实采集口径），这里给个固定 hex
+    let hash = "0123456789abcdef0123456789abcdef";
+
+    std::fs::create_dir_all(&a.formats_dir).expect("建 A 的 formats 目录");
+    let html_path = a.formats_dir.join(format!("{}.html", &hash[..16]));
+    let rtf_path = a.formats_dir.join(format!("{}.rtf", &hash[..16]));
+    std::fs::write(&html_path, &html).expect("写 A 的 html");
+    std::fs::write(&rtf_path, &rtf).expect("写 A 的 rtf");
+    insert_rich_text_row(&a.db, hash, "富文本往返", &html_path, &rtf_path).await;
+
+    let ra = run_cycle(&a).await.expect("A 周期");
+    assert!(ra.uploaded, "A 应上传快照");
+    assert_eq!(ra.skipped_formats, 0, "发送端不得丢格式");
+    for body in [&html, &rtf] {
+        assert!(
+            server
+                .object(&dav_path(&format!("blobs/{}.bin", etag_hex(body))))
+                .is_some(),
+            "富文本 blob 应以内容 hash 为键上传"
+        );
+    }
+
+    let rb = run_cycle(&b).await.expect("B 周期");
+    assert_eq!(rb.inserted, 1, "B 应插入该条目");
+    assert_eq!(rb.skipped_formats, 0, "B 不该跳过格式");
+
+    let row: Option<(String, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT content, html_path, rtf_path FROM items WHERE content_hash = ?",
+    )
+    .bind(hash)
+    .fetch_optional(&b.db)
+    .await
+    .expect("查 B 的条目");
+    let (content, b_html, b_rtf) = row.expect("B 应有该条目");
+    assert_eq!(content, "富文本往返");
+
+    let b_html = b_html.expect("B 的 html_path 必须有值");
+    let b_rtf = b_rtf.expect("B 的 rtf_path 必须有值");
+    let b_formats = std::fs::canonicalize(&b.formats_dir).expect("规范化 B 的 formats 目录");
+    for path in [&b_html, &b_rtf] {
+        assert!(
+            std::fs::canonicalize(path)
+                .expect("B 的格式文件应已落盘")
+                .starts_with(&b_formats),
+            "格式文件必须落在 B 自己的 formats 目录内"
+        );
+    }
+    assert_eq!(
+        std::fs::read(&b_html).expect("读回 B 的 html"),
+        html,
+        "html 字节必须与 A 完全一致"
+    );
+    assert_eq!(
+        std::fs::read(&b_rtf).expect("读回 B 的 rtf"),
+        rtf,
+        "rtf 字节必须与 A 完全一致"
+    );
+
+    // 再跑一轮：已有该行 → 不重复插入，也不再重复上传 blob
+    let puts_before = server.puts();
+    let rb2 = run_cycle(&b).await.expect("B 第二轮");
+    assert_eq!(rb2.inserted, 0, "已存在不应重复插入");
+    assert_eq!(server.puts(), puts_before, "无变化不应再 PUT");
 }

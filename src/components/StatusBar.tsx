@@ -205,7 +205,7 @@ export function StatusBar() {
                     ? 'bg-danger'
                     : 'bg-ok'
               }`}
-              title={syncStatus.last_error || '已同步'}
+              title={syncStatus.last_error || syncStatus.warning || '已同步'}
             />
           </div>
         )}

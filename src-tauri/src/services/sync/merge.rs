@@ -145,6 +145,10 @@ mod tests {
             updated_at,
             deleted_at: None,
             blob_size: None,
+            html_blob: None,
+            html_size: None,
+            rtf_blob: None,
+            rtf_size: None,
         }
     }
 

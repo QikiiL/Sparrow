@@ -17,6 +17,11 @@ use super::SyncError;
 
 /// 状态文件名（位于 config 目录）。
 pub const STATE_FILE: &str = "sync-state.json";
+/// 待写墓碑日志（位于 config 目录）。
+///
+/// 与 `sync-state.json` **解耦**：删除钩子只往这个文件追加一行，不读改写整份状态，
+/// 因此不会和同步循环的 `save()` 互相覆盖。同步循环落盘成功后再删掉它。
+pub const PENDING_TOMBSTONES_FILE: &str = "sync-tombstones.pending";
 /// 原子写的临时文件名（同目录，rename 才是原子的）。
 const TMP_FILE: &str = "sync-state.json.tmp";
 /// 墓碑保留 60 天：足够覆盖一台设备离线两个月的情况，又不至于无限增长。
@@ -130,6 +135,140 @@ pub fn load_or_init(config_dir: &Path) -> SyncStateFile {
 /// IO 错误转 [`SyncError`]：消息里只有文件名与错误类型，不带目录全路径。
 fn io_err(name: &str, e: &std::io::Error) -> SyncError {
     SyncError::config(format!("写入 {name} 失败: {:?}", e.kind()))
+}
+
+/// 读取类错误的映射：同样只带文件名。
+fn read_err(name: &str, e: &std::io::Error) -> SyncError {
+    SyncError::config(format!("读取 {name} 失败: {:?}", e.kind()))
+}
+
+fn pending_path(config_dir: &Path) -> PathBuf {
+    config_dir.join(PENDING_TOMBSTONES_FILE)
+}
+
+/// 待写日志里的 hash 形态校验：非空、长度合理（≤128）、纯 `[a-z0-9]`。
+///
+/// 日志行是磁盘上的外部输入（可能被手工编辑/被别的程序写坏），拼进
+/// `sync-state.json` 前必须过一遍：只放行 ASCII 小写 hex 与数字，
+/// 杜绝引号、换行、`../` 之类的注入/越界值。
+fn is_pending_hash(hash: &str) -> bool {
+    !hash.is_empty()
+        && hash.len() <= 128
+        && hash
+            .bytes()
+            .all(|b| b.is_ascii_digit() || b.is_ascii_lowercase())
+}
+
+/// 追加待写墓碑到 [`PENDING_TOMBSTONES_FILE`]（一次写入 + `sync_all`）。
+///
+/// 用 `create(true).append(true)` 而不是读改写整份 `sync-state.json`：删除钩子
+/// 与同步循环会并发跑，追加写不会互相覆盖。返回实际写入的条数（非法 hash 被丢弃）。
+pub fn append_pending_tombstones(
+    config_dir: &Path,
+    hashes: &[String],
+    deleted_at: i64,
+) -> Result<usize, SyncError> {
+    use std::io::Write;
+
+    let mut buf = String::new();
+    let mut written = 0usize;
+    for hash in hashes.iter().filter(|hash| is_pending_hash(hash)) {
+        let line = serde_json::to_string(&Tombstone {
+            hash: hash.clone(),
+            deleted_at,
+        })
+        .map_err(|e| SyncError::config(format!("序列化 {PENDING_TOMBSTONES_FILE} 失败: {e}")))?;
+        buf.push_str(&line);
+        buf.push('\n');
+        written += 1;
+    }
+    if written == 0 {
+        return Ok(0);
+    }
+
+    std::fs::create_dir_all(config_dir).map_err(|e| io_err("config 目录", &e))?;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(pending_path(config_dir))
+        .map_err(|e| io_err(PENDING_TOMBSTONES_FILE, &e))?;
+    file.write_all(buf.as_bytes())
+        .map_err(|e| io_err(PENDING_TOMBSTONES_FILE, &e))?;
+    // 退出即丢的根因就是"只写进页缓存"：这里显式落盘（Windows 上是 FlushFileBuffers）
+    file.sync_all()
+        .map_err(|e| io_err(PENDING_TOMBSTONES_FILE, &e))?;
+    Ok(written)
+}
+
+/// 读取待写墓碑日志（**不删文件**）。文件不存在 → 空。
+///
+/// 坏行（JSON 解析失败 / hash 不合法）跳过，只打行号与计数，不打内容。
+/// 同 hash 去重取最大 `deleted_at`，最后按 hash 排序（顺序稳定，digest 不抖）。
+pub fn read_pending_tombstones(config_dir: &Path) -> Result<Vec<Tombstone>, SyncError> {
+    let text = match std::fs::read_to_string(pending_path(config_dir)) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(read_err(PENDING_TOMBSTONES_FILE, &e)),
+    };
+
+    let mut out: Vec<Tombstone> = Vec::new();
+    let mut bad_lines: Vec<usize> = Vec::new();
+    let mut total = 0usize;
+    for (idx, line) in text.lines().enumerate() {
+        let line_no = idx + 1;
+        if line.trim().is_empty() {
+            continue;
+        }
+        total += 1;
+        let parsed = serde_json::from_str::<Tombstone>(line).ok();
+        match parsed {
+            Some(t) if is_pending_hash(&t.hash) => {
+                match out.iter_mut().find(|o| o.hash == t.hash) {
+                    Some(existing) => {
+                        if t.deleted_at > existing.deleted_at {
+                            existing.deleted_at = t.deleted_at;
+                        }
+                    }
+                    None => out.push(t),
+                }
+            }
+            _ => bad_lines.push(line_no),
+        }
+    }
+
+    if !bad_lines.is_empty() {
+        // 只报行号与计数：行内容里可能有 hash，不能进日志
+        eprintln!(
+            "sync: {PENDING_TOMBSTONES_FILE} 跳过 {} 行无效记录（行号 {:?}，共 {total} 行）",
+            bad_lines.len(),
+            bad_lines
+        );
+    }
+
+    out.sort_by(|a, b| a.hash.cmp(&b.hash));
+    Ok(out)
+}
+
+/// 删除待写墓碑日志（NotFound 视为成功）。
+pub fn clear_pending_tombstones(config_dir: &Path) -> Result<(), SyncError> {
+    match std::fs::remove_file(pending_path(config_dir)) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(SyncError::config(format!(
+            "删除 {PENDING_TOMBSTONES_FILE} 失败: {:?}",
+            e.kind()
+        ))),
+    }
+}
+
+/// 读取并删除（`read` + `clear`）。同步循环**不要**用它：落盘失败时日志必须保留，
+/// 循环里应显式 `read_pending_tombstones` → 保存 → `clear_pending_tombstones`。
+// 只有测试/简单调用方用；生产路径刻意不用它（会先删后写）
+#[allow(dead_code)]
+pub fn take_pending_tombstones(config_dir: &Path) -> Result<Vec<Tombstone>, SyncError> {
+    let tombstones = read_pending_tombstones(config_dir)?;
+    clear_pending_tombstones(config_dir)?;
+    Ok(tombstones)
 }
 
 impl SyncStateFile {
@@ -384,6 +523,166 @@ mod tests {
             "缺省 device_name 要回落 COMPUTERNAME/device"
         );
         assert!(state.last_upload_hash.is_none());
+        cleanup(&dir);
+    }
+
+    // ---- 待写墓碑日志（sync-tombstones.pending） ----
+
+    #[test]
+    fn append_then_take_reads_all_and_removes_file() {
+        let dir = temp_dir();
+        let hashes = vec!["aaaa".to_string(), "bbbb".to_string()];
+
+        assert_eq!(
+            append_pending_tombstones(&dir, &hashes, 1234).expect("追加"),
+            2,
+            "两条合法 hash 都要写入"
+        );
+        assert!(dir.join(PENDING_TOMBSTONES_FILE).exists(), "文件应已创建");
+
+        let taken = take_pending_tombstones(&dir).expect("读取并删除");
+        assert_eq!(
+            taken,
+            vec![
+                Tombstone {
+                    hash: "aaaa".into(),
+                    deleted_at: 1234
+                },
+                Tombstone {
+                    hash: "bbbb".into(),
+                    deleted_at: 1234
+                },
+            ]
+        );
+        assert!(
+            !dir.join(PENDING_TOMBSTONES_FILE).exists(),
+            "take 之后文件必须消失"
+        );
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn append_skips_invalid_hashes_and_creates_no_file() {
+        let dir = temp_dir();
+        let bad = vec![
+            String::new(),
+            "../etc/passwd".to_string(),
+            "ABC".to_string(),
+            "a".repeat(129),
+        ];
+
+        assert_eq!(append_pending_tombstones(&dir, &bad, 1).expect("追加"), 0);
+        assert!(
+            !dir.join(PENDING_TOMBSTONES_FILE).exists(),
+            "没有合法 hash 时不该创建文件"
+        );
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn read_skips_bad_lines_and_keeps_file() {
+        let dir = temp_dir();
+        std::fs::write(
+            dir.join(PENDING_TOMBSTONES_FILE),
+            concat!(
+                "{\"hash\":\"aaaa\",\"deleted_at\":10}\n",
+                "not json at all\n",
+                "{\"hash\":\"bad/../hash\",\"deleted_at\":11}\n",
+                "\n",
+                "{\"hash\":\"bbbb\"}\n",
+                "{\"hash\":\"cccc\",\"deleted_at\":12}\n"
+            ),
+        )
+        .expect("写混合日志");
+
+        let read = read_pending_tombstones(&dir).expect("读日志");
+        let hashes: Vec<&str> = read.iter().map(|t| t.hash.as_str()).collect();
+        assert_eq!(hashes, vec!["aaaa", "cccc"], "只保留合法行: {hashes:?}");
+        assert!(
+            dir.join(PENDING_TOMBSTONES_FILE).exists(),
+            "read 不删文件（落盘失败时要能重试）"
+        );
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn duplicate_hash_keeps_max_deleted_at() {
+        let dir = temp_dir();
+        std::fs::write(
+            dir.join(PENDING_TOMBSTONES_FILE),
+            concat!(
+                "{\"hash\":\"aaaa\",\"deleted_at\":10}\n",
+                "{\"hash\":\"aaaa\",\"deleted_at\":30}\n",
+                "{\"hash\":\"aaaa\",\"deleted_at\":20}\n"
+            ),
+        )
+        .expect("写重复日志");
+
+        let read = read_pending_tombstones(&dir).expect("读日志");
+        assert_eq!(
+            read,
+            vec![Tombstone {
+                hash: "aaaa".into(),
+                deleted_at: 30
+            }]
+        );
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn empty_or_missing_pending_log_returns_empty() {
+        let dir = temp_dir();
+        assert!(
+            take_pending_tombstones(&dir).expect("缺文件").is_empty(),
+            "文件不存在应返回空"
+        );
+
+        std::fs::write(dir.join(PENDING_TOMBSTONES_FILE), b"").expect("写空文件");
+        assert!(
+            read_pending_tombstones(&dir).expect("空文件").is_empty(),
+            "空文件应返回空"
+        );
+        clear_pending_tombstones(&dir).expect("清空文件");
+        assert!(!dir.join(PENDING_TOMBSTONES_FILE).exists());
+        // 再清一次（NotFound 视为成功）不得报错
+        clear_pending_tombstones(&dir).expect("重复清理");
+        cleanup(&dir);
+    }
+
+    /// 复现"删完直接退出"：日志由上一个进程写，新进程读日志合并进 state。
+    #[test]
+    fn pending_log_survives_restart_and_merges_into_state() {
+        let dir = temp_dir();
+        let hashes = vec!["aaaa".to_string(), "bbbb".to_string()];
+
+        // 进程 A：删除钩子只追加日志，此时还没有 sync-state.json
+        assert_eq!(
+            append_pending_tombstones(&dir, &hashes, 111).expect("追加"),
+            2
+        );
+        assert!(!dir.join(STATE_FILE).exists(), "追加阶段不写 state 文件");
+
+        // 进程 B（新 state）：读日志 → 合并 → 保存 → 清日志
+        let mut st = load_or_init(&dir);
+        assert!(st.tombstones.is_empty(), "新进程的 state 里本来没有墓碑");
+        for t in read_pending_tombstones(&dir).expect("读日志") {
+            st.add_tombstone(&t.hash, t.deleted_at);
+        }
+        st.save(&dir).expect("保存状态");
+        clear_pending_tombstones(&dir).expect("清日志");
+
+        let reloaded = load_or_init(&dir);
+        let mut got: Vec<&str> = reloaded
+            .tombstones
+            .iter()
+            .map(|t| t.hash.as_str())
+            .collect();
+        got.sort_unstable();
+        assert_eq!(got, vec!["aaaa", "bbbb"], "重启后墓碑必须还在 state 里");
+        assert!(
+            !dir.join(PENDING_TOMBSTONES_FILE).exists(),
+            "清过之后日志文件必须消失"
+        );
         cleanup(&dir);
     }
 }

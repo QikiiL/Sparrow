@@ -17,11 +17,13 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use sha2::{Digest, Sha256};
 use sqlx::{Row, SqlitePool};
 use tauri::{Emitter, Listener, Manager};
 
 use crate::models::sync::{
-    Snapshot, SyncProvider, SyncRecord, SyncSecrets, SyncSettings, SyncStatus,
+    max_blob_bytes, Snapshot, SyncMode, SyncProvider, SyncRecord, SyncSecrets, SyncSettings,
+    SyncStatus,
 };
 use crate::services::credentials;
 use crate::services::sync::backend::{build_backend, ObjectMeta, SyncBackend};
@@ -59,6 +61,9 @@ pub struct CycleCtx {
     /// config 目录（`state.rs` 在其中读写 `sync-state.json`）。
     pub state_path: PathBuf,
     pub images_dir: PathBuf,
+    /// formats 目录：富文本副本（CF_HTML / RTF 原始字节）的落地位置，
+    /// 与 `storage_service::formats_dir` 同源（自定义存储位置时跟着走）。
+    pub formats_dir: PathBuf,
     /// 状态上报回调；周期开始发 `syncing`，成功结束发 `idle`。
     pub emit: Box<dyn Fn(SyncStatus) + Send + Sync>,
 }
@@ -78,6 +83,46 @@ pub struct CycleReport {
     /// 只有循环层在失败路径上才把它报成 1。否则"内容没变"的正常周期会
     /// 长期显示"有待同步"。
     pub pending: u32,
+    /// 本轮没能同步的图片数（发送端文件缺失/0 字节/超限 + 接收端 blob 缺失等）。
+    /// 只计"图片丢了"，用户主动关掉图片同步不计。
+    pub skipped_images: u32,
+    /// 本轮没能同步的富文本格式副本数（发送端文件缺失/超限 + 接收端 blob 缺失/
+    /// 解密失败）。HTML 与 RTF 独立计数；纯文本本身照常同步，只是丢了格式。
+    pub skipped_formats: u32,
+}
+
+/// 接收端一条图片的落地结果。
+///
+/// 跳过必须带原因：原来静默 `Ok(false)` 的结果就是"文本同步正常、图片不同步"
+/// 而日志里一个字都没有，用户与开发者都无从下手。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImageOutcome {
+    Inserted,
+    Skipped(&'static str),
+}
+
+/// 一条 `MergeAction::Insert` 的执行结果（内部用，与 [`ImageOutcome`] 一一对应）。
+enum InsertOutcome {
+    /// 真的新增了一行；`skipped_formats` 是这条记录里没能落地的富文本副本数
+    /// （文本已插入，只是那几种格式置 NULL）。
+    Inserted { skipped_formats: u32 },
+    /// 已存在（只刷新 last_used_at）或没有可插入的内容
+    Ignored,
+    /// 图片没落地，带跳过原因
+    ImageSkipped(&'static str),
+}
+
+/// 跳过时给用户看的告警文案（0 个 → 无告警）。
+///
+/// 图片与富文本分开说：用户需要知道丢的是"图片"还是"富文本格式"，
+/// 两者处理方式不同（图片是整条没同步，富文本只是退化成纯文本）。
+fn sync_warning(skipped_images: u32, skipped_formats: u32) -> Option<String> {
+    match (skipped_images, skipped_formats) {
+        (0, 0) => None,
+        (images, 0) => Some(format!("{images} 张图片未同步")),
+        (0, formats) => Some(format!("{formats} 个富文本未同步")),
+        (images, formats) => Some(format!("{images} 张图片、{formats} 个富文本未同步")),
+    }
 }
 
 /// 跑一个完整同步周期。
@@ -94,6 +139,8 @@ pub async fn run_cycle(ctx: &CycleCtx) -> Result<CycleReport, SyncError> {
         last_sync_at: st.last_sync_at,
         last_error: None,
         pending: 0,
+        warning: None,
+        skipped: 0,
     });
 
     let outcome = cycle_body(ctx, &mut st).await;
@@ -105,6 +152,8 @@ pub async fn run_cycle(ctx: &CycleCtx) -> Result<CycleReport, SyncError> {
             last_sync_at: st.last_sync_at,
             last_error: None,
             pending: report.pending,
+            warning: sync_warning(report.skipped_images, report.skipped_formats),
+            skipped: report.skipped_images + report.skipped_formats,
         }),
         Err(e) => {
             if let Err(save_err) = st.save(&ctx.state_path) {
@@ -151,15 +200,23 @@ async fn cycle_body(ctx: &CycleCtx, st: &mut SyncStateFile) -> Result<CycleRepor
     let local = local_view(&ctx.db).await?;
     let mut inserted = 0usize;
     let mut deleted = 0usize;
+    let mut skipped_images: u32 = 0;
+    let mut skipped_formats: u32 = 0;
     for action in merge::plan_merge(&local, &snapshots, &st.tombstones, &st.device_id) {
         match action {
-            MergeAction::Insert(rec) => {
-                if insert_record(ctx, &rec).await? {
+            MergeAction::Insert(rec) => match insert_record(ctx, &rec).await? {
+                InsertOutcome::Inserted { skipped_formats: n } => {
                     inserted += 1;
+                    skipped_formats += n;
                 }
-            }
+                InsertOutcome::Ignored => {}
+                InsertOutcome::ImageSkipped(reason) => {
+                    skipped_images += 1;
+                    eprintln!("sync: skip image {} ({reason})", short_id(&rec.hash));
+                }
+            },
             MergeAction::Delete(hash) => {
-                if delete_local(&ctx.db, &ctx.images_dir, &hash).await? {
+                if delete_local(&ctx.db, &ctx.images_dir, &ctx.formats_dir, &hash).await? {
                     deleted += 1;
                 }
                 st.add_tombstone(&hash, state::now_ms());
@@ -180,14 +237,24 @@ async fn cycle_body(ctx: &CycleCtx, st: &mut SyncStateFile) -> Result<CycleRepor
     } else {
         ctx.settings.device_name.trim().to_string()
     };
-    let mut snap = snapshot::build_snapshot(
+    let build = snapshot::build_snapshot(
         &ctx.db,
         &ctx.settings,
         &st.tombstones,
         &st.device_id,
         &name,
+        &ctx.images_dir,
     )
     .await?;
+    // 发送端被跳过的图片/富文本同样计入本轮告警。明细由 snapshot 收集在
+    // `warnings` 里，这里统一打日志（只含 hash 前 8 位与原因，不含路径），
+    // 否则"留在本机没上去"这件事对用户和开发者都不可见
+    for warning in &build.warnings {
+        eprintln!("sync: snapshot skip {warning}");
+    }
+    skipped_images += build.skipped_images;
+    skipped_formats += build.skipped_formats;
+    let mut snap = build.snapshot;
     append_tombstone_records(&mut snap, &st.tombstones);
 
     // 6. 上传图片 blob（先 blob 后快照：快照一上去 peer 就会来取 blob）
@@ -209,6 +276,8 @@ async fn cycle_body(ctx: &CycleCtx, st: &mut SyncStateFile) -> Result<CycleRepor
         // 走到这里说明本轮所有远端操作都成功了：上传过（uploaded）
         // 或内容没变（digest 命中）都算"没有待同步的东西"。
         pending: 0,
+        skipped_images,
+        skipped_formats,
     })
 }
 
@@ -392,12 +461,13 @@ async fn local_view(db: &SqlitePool) -> Result<HashMap<String, merge::LocalItem>
     Ok(out)
 }
 
-/// 执行一条 `Insert`。返回 true 表示真的新增了一行（"已存在只更新 last_used_at" 返回 false）。
-async fn insert_record(ctx: &CycleCtx, rec: &SyncRecord) -> Result<bool, SyncError> {
+/// 执行一条 `Insert`。`Inserted` 表示真的新增了一行（"已存在只更新 last_used_at"
+/// 返回 `Ignored`）；图片没落地时返回带原因的 `ImageSkipped`，由调用方计数上报。
+async fn insert_record(ctx: &CycleCtx, rec: &SyncRecord) -> Result<InsertOutcome, SyncError> {
     // 防御：墓碑记录不是可插入的条目（plan_merge 正常不会给出，但别让
     // 一条 deleted_at 记录变成 content 为空的幽灵行）
     if rec.hash.is_empty() || rec.deleted_at.is_some() {
-        return Ok(false);
+        return Ok(InsertOutcome::Ignored);
     }
 
     let existing: Option<i64> =
@@ -412,15 +482,18 @@ async fn insert_record(ctx: &CycleCtx, rec: &SyncRecord) -> Result<bool, SyncErr
             .execute(&ctx.db)
             .await
             .map_err(db_err)?;
-        return Ok(false);
+        return Ok(InsertOutcome::Ignored);
     }
 
     if rec.kind == 2 {
-        return insert_image(ctx, rec).await;
+        return Ok(match insert_image(ctx, rec).await? {
+            ImageOutcome::Inserted => InsertOutcome::Inserted { skipped_formats: 0 },
+            ImageOutcome::Skipped(reason) => InsertOutcome::ImageSkipped(reason),
+        });
     }
 
     let Some(content) = rec.content.as_deref().filter(|c| !c.is_empty()) else {
-        return Ok(false);
+        return Ok(InsertOutcome::Ignored);
     };
     let preview = rec
         .preview
@@ -429,67 +502,113 @@ async fn insert_record(ctx: &CycleCtx, rec: &SyncRecord) -> Result<bool, SyncErr
         .map(str::to_string)
         .unwrap_or_else(|| content.chars().take(100).collect());
 
+    // 富文本副本：先把远端 blob 落到本机 formats 目录，成功才写路径列。
+    // 任一种格式拿不到都只把该列置 NULL 并计数，纯文本照常插入
+    // （宁可少一个格式，也不要因为格式丢了整条内容）。
+    let mut skipped_formats: u32 = 0;
+    let html_path = match land_format(
+        ctx,
+        &rec.hash,
+        rec.html_blob.as_deref(),
+        rec.html_size,
+        FORMAT_HTML,
+    )
+    .await?
+    {
+        Landed::Path(path) => Some(path),
+        Landed::Absent => None,
+        Landed::Skipped(reason) => {
+            skipped_formats += 1;
+            eprintln!("sync: skip html {} ({reason})", short_id(&rec.hash));
+            None
+        }
+    };
+    let rtf_path = match land_format(
+        ctx,
+        &rec.hash,
+        rec.rtf_blob.as_deref(),
+        rec.rtf_size,
+        FORMAT_RTF,
+    )
+    .await?
+    {
+        Landed::Path(path) => Some(path),
+        Landed::Absent => None,
+        Landed::Skipped(reason) => {
+            skipped_formats += 1;
+            eprintln!("sync: skip rtf {} ({reason})", short_id(&rec.hash));
+            None
+        }
+    };
+
     sqlx::query(
-        "INSERT INTO items (type, content, content_hash, preview, created_at, last_used_at)
-         VALUES (?, ?, ?, ?, datetime(? / 1000, 'unixepoch'), datetime(? / 1000, 'unixepoch'))",
+        "INSERT INTO items (type, content, content_hash, preview, html_path, rtf_path,
+                            created_at, last_used_at)
+         VALUES (?, ?, ?, ?, ?, ?, datetime(? / 1000, 'unixepoch'), datetime(? / 1000, 'unixepoch'))",
     )
     .bind(rec.kind)
     .bind(content)
     .bind(&rec.hash)
     .bind(preview)
+    .bind(&html_path)
+    .bind(&rtf_path)
     .bind(rec.created_at)
     .bind(rec.updated_at)
     .execute(&ctx.db)
     .await
     .map_err(db_err)?;
 
-    Ok(true)
+    Ok(InsertOutcome::Inserted { skipped_formats })
 }
 
-/// 图片条目：先把 blob 落到 `images_dir/{hash 前 16 位}.png`（已存在则复用），再插行。
-async fn insert_image(ctx: &CycleCtx, rec: &SyncRecord) -> Result<bool, SyncError> {
+/// 图片条目：先把 blob 落到 `images_dir/{hash 前 16 位}.png`（已有非空文件则复用），
+/// 再插行。任何一步失败都返回带原因的 [`ImageOutcome::Skipped`]，绝不静默返回。
+async fn insert_image(ctx: &CycleCtx, rec: &SyncRecord) -> Result<ImageOutcome, SyncError> {
     // 本机不同步图片时也不要把 peer 的图片拉下来（用户关掉图片同步是明确的意图）
     if !ctx.settings.sync_images {
-        return Ok(false);
+        return Ok(ImageOutcome::Skipped("sync_images 关闭"));
     }
 
     // 远端 hash 会拼进 blob key 与本地文件名：只接受 ≥32 位纯 ASCII hex，
     // 否则 `../` 之类的内容能把路径拼出 images 目录。
     if !is_blob_hash(&rec.hash) {
-        eprintln!("sync: skip image {} (hash 非法)", short_id(&rec.hash));
-        return Ok(false);
+        return Ok(ImageOutcome::Skipped("hash 非法"));
     }
+    let max_bytes = max_blob_bytes(&ctx.settings);
     if let Some(size) = rec.blob_size {
-        let max_bytes = u64::from(ctx.settings.max_blob_mb) * 1024 * 1024;
         if size > max_bytes {
-            eprintln!(
-                "sync: skip image {} (远端声明 {} 字节，超过 {} MB)",
-                short_id(&rec.hash),
-                size,
-                ctx.settings.max_blob_mb
-            );
-            return Ok(false);
+            return Ok(ImageOutcome::Skipped("超过大小上限"));
         }
     }
 
     let path = ctx.images_dir.join(format!("{}.png", short16(&rec.hash)));
-    if !path.exists() {
+    // 目标文件存在但为 0 字节：上次落盘被打断（掉电/崩溃/磁盘满）留下的残骸。
+    // 早退"已存在就复用"会让这张图永远坏在本地，所以必须删掉重下。
+    let usable = std::fs::metadata(&path)
+        .map(|meta| meta.is_file() && meta.len() > 0)
+        .unwrap_or(false);
+    if !usable {
+        if path.exists() {
+            let _ = std::fs::remove_file(&path);
+        }
         let key = blob_key(&rec.hash);
         let Some(sealed) = remote_get(ctx, &key).await? else {
-            eprintln!("sync: skip image {} (blob 缺失)", short_id(&rec.hash));
-            return Ok(false);
+            return Ok(ImageOutcome::Skipped("blob 缺失"));
         };
         let plain = match crypto::open_blob(&ctx.key, &key, &sealed) {
             Ok(plain) => plain,
-            Err(e) => {
-                eprintln!(
-                    "sync: skip image {} kind={}",
-                    short_id(&rec.hash),
-                    e.kind.as_str()
-                );
-                return Ok(false);
-            }
+            Err(_) => return Ok(ImageOutcome::Skipped("解密失败")),
         };
+        // 明文长度必须与快照声明一致：不一致说明 blob 被截断/写坏，
+        // 落盘只会得到一张坏图（临时文件一并清掉，别留残骸）
+        if let Some(expected) = rec.blob_size {
+            if plain.len() as u64 != expected {
+                let tmp = path.with_extension("png.tmp");
+                let _ = std::fs::remove_file(&tmp);
+                let _ = std::fs::remove_file(&path);
+                return Ok(ImageOutcome::Skipped("大小不符"));
+            }
+        }
         write_atomic(&ctx.images_dir, &path, &plain)?;
     }
 
@@ -508,17 +627,114 @@ async fn insert_image(ctx: &CycleCtx, rec: &SyncRecord) -> Result<bool, SyncErro
     .await
     .map_err(db_err)?;
 
-    Ok(true)
+    Ok(ImageOutcome::Inserted)
 }
 
-/// 执行一条 `Delete`：先取 `file_path` 再删行，最后按 images 目录守卫删文件。
-async fn delete_local(db: &SqlitePool, images_dir: &Path, hash: &str) -> Result<bool, SyncError> {
-    let file_path: Option<String> =
-        sqlx::query_scalar("SELECT file_path FROM items WHERE content_hash = ? LIMIT 1")
-            .bind(hash)
-            .fetch_optional(db)
-            .await
-            .map_err(db_err)?;
+// ---------------------------------------------------------------------------
+// 富文本副本（HTML / RTF 原始字节）落地
+// ---------------------------------------------------------------------------
+
+/// formats 目录里的两种扩展名（与 `clipboard_monitor::save_format_to_disk` 一致）。
+const FORMAT_HTML: &str = "html";
+const FORMAT_RTF: &str = "rtf";
+
+/// 一种富文本副本的落地结果。
+enum Landed {
+    /// 该条目没有这种格式（快照里 blob 字段为 None）
+    Absent,
+    /// 已落盘（或复用本机已有的同名文件），返回写进 `html_path`/`rtf_path` 的路径
+    Path(String),
+    /// 有 blob 但拿不到（缺失 / 解密失败 / 超限 / 校验失败），带原因
+    Skipped(&'static str),
+}
+
+/// 把一条记录的某一种富文本副本从远端落到本机 formats 目录。
+///
+/// 本地文件名用 **`record.hash` 前 16 位 + 扩展名**（与采集端
+/// `clipboard_monitor::save_format_to_disk` 的命名一致），**不用 blob hash**：
+/// 两个条目可能共享同一份 html 字节，按 blob hash 命名会让它们指向同一个文件，
+/// 删掉其中一个就把另一个的格式文件一起带走了。
+async fn land_format(
+    ctx: &CycleCtx,
+    record_hash: &str,
+    blob_hash: Option<&str>,
+    size: Option<u64>,
+    ext: &str,
+) -> Result<Landed, SyncError> {
+    let Some(blob_hash) = blob_hash.filter(|h| !h.is_empty()) else {
+        return Ok(Landed::Absent);
+    };
+    // blob hash 会拼进对象 key（`blobs/{hash}.bin`），peer 快照里的字段不可全信
+    if !is_blob_hash(blob_hash) {
+        return Ok(Landed::Skipped("blob hash 非法"));
+    }
+    // record.hash 会拼进**本地文件名**：同样只接受 ≥32 位 hex，
+    // 否则 peer 用 `../../x` 之类的 hash 就能把文件写到 formats 目录外
+    if !is_blob_hash(record_hash) {
+        return Ok(Landed::Skipped("record hash 非法"));
+    }
+    let max_bytes = max_blob_bytes(&ctx.settings);
+    if let Some(size) = size {
+        if size > max_bytes {
+            return Ok(Landed::Skipped("超过大小上限"));
+        }
+    }
+
+    let path = ctx
+        .formats_dir
+        .join(format!("{}.{ext}", short16(record_hash)));
+    // 本机采集时就已经写过一份同名文件（同一 content_hash → 同一份 html 字节），
+    // 大小一致即可复用，省一次下载。0 字节/大小不符的残骸必须删掉重下。
+    let existing = std::fs::metadata(&path)
+        .ok()
+        .filter(|meta| meta.is_file() && meta.len() > 0)
+        .map(|meta| meta.len());
+    if let (Some(len), Some(expected)) = (existing, size) {
+        if len == expected {
+            return Ok(Landed::Path(path.to_string_lossy().to_string()));
+        }
+    }
+    if path.exists() {
+        let _ = std::fs::remove_file(&path);
+    }
+
+    let key = blob_key(blob_hash);
+    let Some(sealed) = remote_get(ctx, &key).await? else {
+        return Ok(Landed::Skipped("blob 缺失"));
+    };
+    let plain = match crypto::open_blob(&ctx.key, &key, &sealed) {
+        Ok(plain) => plain,
+        Err(_) => return Ok(Landed::Skipped("解密失败")),
+    };
+    // 内容寻址自校验：明文必须真的哈希回 blob_hash，否则等于往本机写未知内容
+    if sha256_hex(&plain) != blob_hash {
+        return Ok(Landed::Skipped("内容校验失败"));
+    }
+    if let Some(expected) = size {
+        if plain.len() as u64 != expected {
+            return Ok(Landed::Skipped("大小不符"));
+        }
+    }
+    write_atomic(&ctx.formats_dir, &path, &plain)?;
+
+    Ok(Landed::Path(path.to_string_lossy().to_string()))
+}
+
+/// 执行一条 `Delete`：先取 `file_path`/`html_path`/`rtf_path` 再删行，
+/// 最后按各自目录守卫删文件。
+async fn delete_local(
+    db: &SqlitePool,
+    images_dir: &Path,
+    formats_dir: &Path,
+    hash: &str,
+) -> Result<bool, SyncError> {
+    let row: Option<(Option<String>, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT file_path, html_path, rtf_path FROM items WHERE content_hash = ? LIMIT 1",
+    )
+    .bind(hash)
+    .fetch_optional(db)
+    .await
+    .map_err(db_err)?;
 
     let res = sqlx::query("DELETE FROM items WHERE content_hash = ?")
         .bind(hash)
@@ -529,8 +745,15 @@ async fn delete_local(db: &SqlitePool, images_dir: &Path, hash: &str) -> Result<
         return Ok(false);
     }
 
-    if let Some(path) = file_path {
-        remove_local_image(images_dir, &path);
+    if let Some((file_path, html_path, rtf_path)) = row {
+        if let Some(path) = file_path {
+            remove_local_image(images_dir, &path);
+        }
+        // 富文本副本必须跟着条目一起删：留下孤儿文件会被 image_cleanup 之外
+        // 的清理路径漏掉，白占磁盘
+        for path in [html_path, rtf_path].into_iter().flatten() {
+            remove_local_format(formats_dir, &path);
+        }
     }
     Ok(true)
 }
@@ -541,7 +764,18 @@ async fn delete_local(db: &SqlitePool, images_dir: &Path, hash: &str) -> Result<
 /// `storage_service::resolve_image_path`），本模块刻意不依赖 Tauri，
 /// 所以在这里复刻同一条守卫：规范化后必须落在 images 目录内才删。
 fn remove_local_image(images_dir: &Path, file_path: &str) {
-    let Ok(dir) = std::fs::canonicalize(images_dir) else {
+    remove_within(images_dir, file_path);
+}
+
+/// 删除 formats 目录内的富文本副本文件（守卫与 [`remove_local_image`] 相同：
+/// `html_path`/`rtf_path` 来自数据库，可能被改成任意路径）。
+fn remove_local_format(formats_dir: &Path, file_path: &str) {
+    remove_within(formats_dir, file_path);
+}
+
+/// canonicalize 后必须落在 `dir` 内才删（两侧都规范化，避免 `..` 绕过）。
+fn remove_within(dir: &Path, file_path: &str) {
+    let Ok(dir) = std::fs::canonicalize(dir) else {
         return;
     };
     let Ok(canonical) = std::fs::canonicalize(file_path) else {
@@ -567,6 +801,10 @@ fn append_tombstone_records(snap: &mut Snapshot, tombstones: &[Tombstone]) {
             updated_at: t.deleted_at,
             deleted_at: Some(t.deleted_at),
             blob_size: None,
+            html_blob: None,
+            html_size: None,
+            rtf_blob: None,
+            rtf_size: None,
         });
     }
 }
@@ -575,16 +813,20 @@ fn append_tombstone_records(snap: &mut Snapshot, tombstones: &[Tombstone]) {
 // 3. 上传
 // ---------------------------------------------------------------------------
 
-/// 上传快照里引用的、本机还没传过的图片 blob。
+/// 上传快照里引用的、本机还没传过的 blob：图片 + 富文本副本（HTML/RTF）。
+///
+/// 两者共用同一份 `uploaded_blobs` 去重集合 —— 它们都是内容寻址对象，
+/// 键就是内容 hash，落在同一个 `blobs/` 前缀下。
 async fn upload_blobs(
     ctx: &CycleCtx,
     st: &mut SyncStateFile,
     snap: &Snapshot,
 ) -> Result<(), SyncError> {
-    let images = image_rows(&ctx.db).await?;
-    let done: HashSet<String> = st.uploaded_blobs.iter().cloned().collect();
-    let max_bytes = u64::from(ctx.settings.max_blob_mb) * 1024 * 1024;
+    let max_bytes = max_blob_bytes(&ctx.settings);
+    let mut done: HashSet<String> = st.uploaded_blobs.iter().cloned().collect();
 
+    // 1. 图片：blob key 就是 record.hash（图片的 content_hash 即文件字节的 hash）
+    let images = image_rows(&ctx.db).await?;
     for rec in snap
         .records
         .iter()
@@ -604,9 +846,8 @@ async fn upload_blobs(
 
         let Some(bytes) = read_blob_file(&path, max_bytes).await? else {
             eprintln!(
-                "sync: skip blob {} (文件缺失或超过 {} MB)",
-                short_id(&rec.hash),
-                ctx.settings.max_blob_mb
+                "sync: skip blob {} (文件缺失或超过大小上限)",
+                short_id(&rec.hash)
             );
             continue;
         };
@@ -617,8 +858,83 @@ async fn upload_blobs(
         // "内容寻址、已经存在"误当成"无需上传"，远端就永远留着解不开的旧密文。
         remote_put(ctx, &key, sealed, None).await?;
         st.uploaded_blobs.push(rec.hash.clone());
+        done.insert(rec.hash.clone());
     }
 
+    // 2. 富文本副本：blob key 是**内容** hash（html_blob/rtf_blob），
+    //    与 record.hash 无关 —— 同一份 html 被两个条目共享时只上传一次。
+    let formats = format_rows(&ctx.db).await?;
+    for rec in snap
+        .records
+        .iter()
+        .filter(|r| r.kind != 2 && r.deleted_at.is_none())
+    {
+        let Some((_, html_path, rtf_path)) = formats.iter().find(|(hash, _, _)| hash == &rec.hash)
+        else {
+            continue;
+        };
+        for (blob_hash, path) in [
+            (rec.html_blob.as_deref(), html_path.as_deref()),
+            (rec.rtf_blob.as_deref(), rtf_path.as_deref()),
+        ] {
+            let Some(blob_hash) = blob_hash else {
+                continue;
+            };
+            upload_one_blob(ctx, st, &mut done, blob_hash, path, max_bytes).await?;
+        }
+    }
+
+    Ok(())
+}
+
+/// 上传一个富文本副本 blob。
+///
+/// 读取后必须自校验 `sha256(bytes) == blob_hash`：快照构建完成到此刻之间文件
+/// 可能被改写（用户编辑条目会换 content_hash，但删除/清理可能留下半截文件）。
+/// 不一致就跳过 —— 下一轮快照重算会得出新的 blob hash，自然重试。
+async fn upload_one_blob(
+    ctx: &CycleCtx,
+    st: &mut SyncStateFile,
+    done: &mut HashSet<String>,
+    blob_hash: &str,
+    path: Option<&str>,
+    max_bytes: u64,
+) -> Result<(), SyncError> {
+    if done.contains(blob_hash) {
+        return Ok(());
+    }
+    if !is_blob_hash(blob_hash) {
+        eprintln!("sync: skip format blob {} (hash 非法)", short_id(blob_hash));
+        return Ok(());
+    }
+    let Some(path) = path else {
+        eprintln!(
+            "sync: skip format blob {} (无本地文件)",
+            short_id(blob_hash)
+        );
+        return Ok(());
+    };
+    let Some(bytes) = read_blob_file(path, max_bytes).await? else {
+        eprintln!(
+            "sync: skip format blob {} (文件缺失或超过大小上限)",
+            short_id(blob_hash)
+        );
+        return Ok(());
+    };
+    if sha256_hex(&bytes) != blob_hash {
+        eprintln!(
+            "sync: skip format blob {} (内容与 hash 不符)",
+            short_id(blob_hash)
+        );
+        return Ok(());
+    }
+
+    let key = blob_key(blob_hash);
+    let sealed = crypto::seal_blob(&ctx.key, &key, &bytes)?;
+    // 无条件 PUT，理由同图片 blob
+    remote_put(ctx, &key, sealed, None).await?;
+    st.uploaded_blobs.push(blob_hash.to_string());
+    done.insert(blob_hash.to_string());
     Ok(())
 }
 
@@ -637,7 +953,26 @@ async fn image_rows(db: &SqlitePool) -> Result<Vec<(String, Option<String>)>, Sy
     Ok(out)
 }
 
-/// 读图片文件（在阻塞池里跑）；缺失/非文件/超限返回 None。
+/// `SELECT content_hash, html_path, rtf_path FROM items WHERE type IN (0,1)`。
+async fn format_rows(
+    db: &SqlitePool,
+) -> Result<Vec<(String, Option<String>, Option<String>)>, SyncError> {
+    let rows =
+        sqlx::query("SELECT content_hash, html_path, rtf_path FROM items WHERE type IN (0,1)")
+            .fetch_all(db)
+            .await
+            .map_err(db_err)?;
+    let mut out = Vec::with_capacity(rows.len());
+    for row in &rows {
+        let hash: String = row.try_get("content_hash").map_err(sqlx_err)?;
+        let html: Option<String> = row.try_get("html_path").map_err(sqlx_err)?;
+        let rtf: Option<String> = row.try_get("rtf_path").map_err(sqlx_err)?;
+        out.push((hash, html, rtf));
+    }
+    Ok(out)
+}
+
+/// 读一个 blob 源文件（在阻塞池里跑）；缺失/非文件/超限返回 None。
 async fn read_blob_file(path: &str, max_bytes: u64) -> Result<Option<Vec<u8>>, SyncError> {
     let path = path.to_string();
     io(move || {
@@ -649,7 +984,7 @@ async fn read_blob_file(path: &str, max_bytes: u64) -> Result<Option<Vec<u8>>, S
         }
         std::fs::read(&path).map(Some).map_err(|e| {
             // 只报错误类型，不报路径
-            SyncError::config(format!("读取图片失败: {:?}", e.kind()))
+            SyncError::config(format!("读取文件失败: {:?}", e.kind()))
         })
     })
     .await
@@ -738,17 +1073,33 @@ fn short16(hash: &str) -> String {
     hash.chars().take(16).collect()
 }
 
-/// 先写 `.tmp` 再 rename，避免掉电/崩溃留下半张图。
+/// 先写 `.tmp` 再 rename，避免掉电/崩溃留下半个文件。
 fn write_atomic(dir: &Path, dest: &Path, bytes: &[u8]) -> Result<(), SyncError> {
     std::fs::create_dir_all(dir)
-        .map_err(|e| SyncError::config(format!("创建 images 目录失败: {:?}", e.kind())))?;
-    let tmp = dest.with_extension("png.tmp");
+        .map_err(|e| SyncError::config(format!("创建数据目录失败: {:?}", e.kind())))?;
+    let tmp = dest.with_file_name(format!(
+        "{}.tmp",
+        dest.file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_else(|| "blob".to_string())
+    ));
     std::fs::write(&tmp, bytes)
-        .map_err(|e| SyncError::config(format!("写入图片临时文件失败: {:?}", e.kind())))?;
+        .map_err(|e| SyncError::config(format!("写入临时文件失败: {:?}", e.kind())))?;
     std::fs::rename(&tmp, dest).map_err(|e| {
         let _ = std::fs::remove_file(&tmp);
-        SyncError::config(format!("图片落盘失败: {:?}", e.kind()))
+        SyncError::config(format!("落盘失败: {:?}", e.kind()))
     })
+}
+
+/// sha256 hex（小写），用于 blob 内容自校验。
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 fn db_err(e: sqlx::Error) -> SyncError {
@@ -775,6 +1126,10 @@ const WAKE_DEBOUNCE: Duration = Duration::from_millis(400);
 const CLIPBOARD_CHANGED: &str = "clipboard-changed";
 
 /// 未启用时的配置轮询间隔：只读一次内存里的配置副本，不碰网络与密钥。
+///
+/// 这里刻意**不**用 `wait_next`：未启用时循环不联网，2s 只是重新读一次内存配置，
+/// 保证「启用」即使漏掉一次唤醒也会在 2s 内被观察到；与「仅启动时」的静默语义
+/// 不冲突（那时本来就没有任何同步动作）。
 const DISABLED_POLL: Duration = Duration::from_secs(2);
 /// 出错后的最小重试间隔（计划第 6 节：max(poll, 30s)）。
 const ERROR_MIN_INTERVAL: Duration = Duration::from_secs(30);
@@ -832,6 +1187,8 @@ fn same_status(a: &SyncStatus, b: &SyncStatus) -> bool {
         && a.last_sync_at == b.last_sync_at
         && a.last_error == b.last_error
         && a.pending == b.pending
+        && a.warning == b.warning
+        && a.skipped == b.skipped
 }
 
 /// 同步服务的运行句柄。由 `lib.rs` 在 setup 里 `app.manage`。
@@ -870,20 +1227,44 @@ impl SyncHandle {
     }
 
     /// 入队待写墓碑（显式删除/清空后调用）。去重，空串忽略。
+    ///
+    /// 入队的同时把 hash **追加**到 `sync-tombstones.pending`（与 `sync-state.json`
+    /// 解耦的日志文件）：`sync_mode = startup` 不唤醒循环，用户删完直接退出进程时
+    /// 内存队列会丢，日志文件不会——下次启动第一轮读回来合并，已删条目就不会复活。
+    ///
+    /// `sync_mode = interval`：入队后立即唤醒一轮，墓碑尽快落盘。
+    /// `sync_mode = startup`：只入队、**不唤醒**，等下一次手动同步或下次启动的那一轮落盘。
     pub fn queue_tombstones(&self, hashes: Vec<String>) {
+        let hashes: Vec<String> = hashes.into_iter().filter(|h| !h.is_empty()).collect();
         if hashes.is_empty() {
             return;
         }
         let inner = Arc::clone(&self.inner);
         tauri::async_runtime::spawn(async move {
+            // 先落盘再入内存队列：即使本进程下一秒被关掉，墓碑也已经写在磁盘上
+            let dir = inner.config_dir.clone();
+            let to_disk = hashes.clone();
+            let appended = tauri::async_runtime::spawn_blocking(move || {
+                state::append_pending_tombstones(&dir, &to_disk, state::now_ms())
+            })
+            .await;
+            match appended {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => eprintln!("sync: 墓碑日志写入失败 kind={}", e.kind.as_str()),
+                Err(_) => eprintln!("sync: 墓碑日志写入失败 kind=join"),
+            }
+
             let mut pending = inner.pending_tombstones.lock().await;
             for hash in hashes {
-                if !hash.is_empty() {
-                    pending.insert(hash);
-                }
+                pending.insert(hash);
             }
             drop(pending);
-            inner.notify.notify_one();
+            // 仅启动时：删除**不**触发同步。墓碑留在队列里，等下次启动或手动
+            // 「立即同步」时随那一轮落盘（`run_loop` 每轮先取队列）。
+            let mode = inner.settings.lock().await.sync_mode;
+            if should_wake(mode) {
+                inner.notify.notify_one();
+            }
         });
     }
 }
@@ -926,6 +1307,9 @@ pub fn start(app: tauri::AppHandle, db: SqlitePool, config_dir: PathBuf) -> Sync
 ///
 /// 防回环：同步自己写库后也会 emit `clipboard-changed`（刷新前端列表），
 /// 周期期间 `applying` 为 true，回调直接忽略，因此不会"同步 → 事件 → 再同步"。
+///
+/// `sync_mode = startup` 时回调直接返回：复制/删除不触发同步，只有手动
+/// 「立即同步」、保存设置、切换模式才会唤醒循环。
 fn register_wakeup(inner: &Arc<Inner>) {
     for event in LOCAL_CHANGE_EVENTS {
         // 只持 Weak：监听器挂在 AppHandle 上，强引用会让 Inner 永远无法释放
@@ -936,6 +1320,13 @@ fn register_wakeup(inner: &Arc<Inner>) {
             };
             if inner.applying.load(Ordering::SeqCst) {
                 return;
+            }
+            // 仅启动时：本机复制/删除一律不唤醒（严格静默）。
+            // 取不到配置锁（极少见）时按"能唤醒"处理，宁可多跑一轮也不漏同步。
+            if let Ok(cfg) = inner.settings.try_lock() {
+                if !should_wake(cfg.sync_mode) {
+                    return;
+                }
             }
             let mine = next_generation(&inner.generation);
             tauri::async_runtime::spawn(async move {
@@ -992,12 +1383,31 @@ fn initial_status(cfg: &SyncSettings, st: &SyncStateFile) -> SyncStatus {
         last_sync_at: st.last_sync_at,
         last_error: None,
         pending: 0,
+        warning: None,
+        skipped: 0,
     }
 }
 
 /// 轮询间隔：`poll_interval_sec` 夹到 2–300s（0 会让循环空转）。
 fn poll_interval(cfg: &SyncSettings) -> Duration {
     Duration::from_secs(u64::from(cfg.poll_interval_sec.clamp(2, 300)))
+}
+
+/// 下一轮要等多久（纯逻辑，便于单测）。
+///
+/// - `Interval` → 按 `poll_interval_sec` 定时唤醒；
+/// - `Startup` → `None`：**不设定时器**，只有手动「立即同步」/保存设置/切换模式
+///   的 [`Inner::notify`] 才会让循环再跑一轮。
+fn next_wait(cfg: &SyncSettings) -> Option<Duration> {
+    match cfg.sync_mode {
+        SyncMode::Interval => Some(poll_interval(cfg)),
+        SyncMode::Startup => None,
+    }
+}
+
+/// 事件是否该唤醒循环：只有轮询模式响应本机复制/删除。
+fn should_wake(mode: SyncMode) -> bool {
+    mode == SyncMode::Interval
 }
 
 /// `ensure_dirs` 的配置指纹：provider + 地址 + bucket + root。
@@ -1062,6 +1472,8 @@ fn publish_error(inner: &Inner, device_id: &str, last_sync_at: i64, message: Str
         last_sync_at,
         last_error: Some(message),
         pending: 1,
+        warning: None,
+        skipped: 0,
     });
 }
 
@@ -1073,7 +1485,33 @@ async fn wait(inner: &Inner, dur: Duration) {
     }
 }
 
-/// 轮询循环：配置 → 密钥 → 后端 → 墓碑落盘 → 一个周期 → 等待。
+/// 等下一轮：`Interval` 用定时器，`Startup` 只等唤醒信号（不设定时器）。
+async fn wait_next(inner: &Inner, cfg: &SyncSettings) {
+    match next_wait(cfg) {
+        Some(d) => wait(inner, d).await,
+        // 仅启动时：进程启动跑过一轮后就在这里静默，直到有人 notify
+        None => {
+            inner.notify.notified().await;
+        }
+    }
+}
+
+/// 出错后的等待：`Interval` 仍保留 `max(间隔, 30s)` 的退避；`Startup` 不自动重试，
+/// 下一次手动同步或重启才再试（严格「仅启动时」语义）。
+async fn wait_retry(inner: &Inner, cfg: &SyncSettings) {
+    match next_wait(cfg) {
+        Some(d) => wait(inner, d.max(ERROR_MIN_INTERVAL)).await,
+        None => {
+            inner.notify.notified().await;
+        }
+    }
+}
+
+/// 同步循环：配置 → 密钥 → 后端 → 墓碑落盘 → 一个周期 → 等待。
+///
+/// `sync_mode = interval`：跑完等 `poll_interval_sec`，事件也会提前唤醒。
+/// `sync_mode = startup`：启动跑一轮后不再设定时器，只等唤醒信号
+/// （见 [`wait_next`] / [`should_wake`]）。
 async fn run_loop(inner: Arc<Inner>) {
     // 上次成功 ensure_dirs 的配置指纹。循环局部即可：重启后多一次 MKCOL 无害
     let mut last_ensured: Option<String> = None;
@@ -1092,7 +1530,10 @@ async fn run_loop(inner: Arc<Inner>) {
                 last_sync_at,
                 last_error: None,
                 pending: 0,
+                warning: None,
+                skipped: 0,
             });
+            // 未启用分支仍用 2s 的轻量配置轮询（理由见 DISABLED_POLL）
             wait(&inner, DISABLED_POLL).await;
             continue;
         }
@@ -1104,28 +1545,37 @@ async fn run_loop(inner: Arc<Inner>) {
             last_sync_at,
             last_error: None,
             pending: 0,
+            warning: None,
+            skipped: 0,
         });
-
-        let interval = poll_interval(&cfg);
-        let retry_interval = interval.max(ERROR_MIN_INTERVAL);
 
         // 3. 凭证（keyring / 环境变量，阻塞 API → 线程池）
         let secrets = match tauri::async_runtime::spawn_blocking(credentials::load_all).await {
             Ok(Ok(secrets)) => secrets,
             Ok(Err(e)) => {
                 publish_error(&inner, &device_id, last_sync_at, e);
-                wait(&inner, retry_interval).await;
+                wait_retry(&inner, &cfg).await;
                 continue;
             }
             Err(e) => {
-                publish_error(&inner, &device_id, last_sync_at, format!("读取凭据失败: {e}"));
-                wait(&inner, retry_interval).await;
+                publish_error(
+                    &inner,
+                    &device_id,
+                    last_sync_at,
+                    format!("读取凭据失败: {e}"),
+                );
+                wait_retry(&inner, &cfg).await;
                 continue;
             }
         };
         if secrets.passphrase.trim().is_empty() {
-            publish_error(&inner, &device_id, last_sync_at, NEED_PASSPHRASE.to_string());
-            wait(&inner, retry_interval).await;
+            publish_error(
+                &inner,
+                &device_id,
+                last_sync_at,
+                NEED_PASSPHRASE.to_string(),
+            );
+            wait_retry(&inner, &cfg).await;
             continue;
         }
 
@@ -1145,7 +1595,7 @@ async fn run_loop(inner: Arc<Inner>) {
             Ok(Err(e)) => {
                 // SyncError 的 Display 已脱敏（无 URL userinfo / query / 凭证）
                 publish_error(&inner, &device_id, last_sync_at, e.to_string());
-                wait(&inner, retry_interval).await;
+                wait_retry(&inner, &cfg).await;
                 continue;
             }
             Err(e) => {
@@ -1155,7 +1605,7 @@ async fn run_loop(inner: Arc<Inner>) {
                     last_sync_at,
                     format!("同步准备失败: {e}"),
                 );
-                wait(&inner, retry_interval).await;
+                wait_retry(&inner, &cfg).await;
                 continue;
             }
         };
@@ -1164,22 +1614,58 @@ async fn run_loop(inner: Arc<Inner>) {
         }
 
         // 5. 待写墓碑先落盘：run_cycle 读的是同一份 sync-state.json，
-        //    不先写进去，本轮快照里就不会带这些删除
-        let pending: Vec<String> = {
+        //    不先写进去，本轮快照里就不会带这些删除。
+        //    两路来源：内存队列（本进程入队）+ 磁盘日志（上个进程删完就退出，
+        //    只留下 sync-tombstones.pending）。顺序固定为"读日志 → 写 state →
+        //    清日志"：state 写失败时日志必须留着，下次启动重试。
+        let from_memory: Vec<String> = {
             let mut guard = inner.pending_tombstones.lock().await;
             let mut taken: Vec<String> = std::mem::take(&mut *guard).into_iter().collect();
             // 集合本身无序：排一下，快照记录的追加顺序才稳定（digest 不抖）
             taken.sort();
             taken
         };
-        if !pending.is_empty() {
+        let read_dir = inner.config_dir.clone();
+        let (from_disk, disk_read_ok) = match tauri::async_runtime::spawn_blocking(move || {
+            state::read_pending_tombstones(&read_dir)
+        })
+        .await
+        {
+            Ok(Ok(list)) => (list, true),
+            Ok(Err(e)) => {
+                eprintln!("sync: 墓碑日志读取失败 kind={}", e.kind.as_str());
+                (Vec::new(), false)
+            }
+            Err(_) => {
+                eprintln!("sync: 墓碑日志读取失败 kind=join");
+                (Vec::new(), false)
+            }
+        };
+        if !from_memory.is_empty() || !from_disk.is_empty() {
             let mut st = state::load_or_init(&inner.config_dir);
             let now = state::now_ms();
-            for hash in pending.iter().filter(|hash| !hash.is_empty()) {
+            for hash in from_memory.iter().filter(|hash| !hash.is_empty()) {
                 st.add_tombstone(hash, now);
             }
-            if let Err(e) = st.save(&inner.config_dir) {
-                eprintln!("sync: 墓碑落盘失败 kind={}", e.kind.as_str());
+            for tombstone in &from_disk {
+                st.add_tombstone(&tombstone.hash, tombstone.deleted_at);
+            }
+            match st.save(&inner.config_dir) {
+                Ok(()) => {
+                    // 写成功才删日志；读失败过（disk_read_ok=false）时也不删
+                    if disk_read_ok {
+                        if let Err(e) = state::clear_pending_tombstones(&inner.config_dir) {
+                            eprintln!("sync: 墓碑日志清理失败 kind={}", e.kind.as_str());
+                        }
+                    }
+                }
+                // 保存失败：日志不动，下一轮/下次启动还会读到（宁可重复也不丢删除）
+                Err(e) => eprintln!("sync: 墓碑落盘失败 kind={}", e.kind.as_str()),
+            }
+        } else if disk_read_ok {
+            // 日志里没有可合并的墓碑（空文件 / 全是坏行）：清掉，否则每轮都白读一遍
+            if let Err(e) = state::clear_pending_tombstones(&inner.config_dir) {
+                eprintln!("sync: 墓碑日志清理失败 kind={}", e.kind.as_str());
             }
         }
 
@@ -1203,6 +1689,7 @@ async fn run_loop(inner: Arc<Inner>) {
             },
             state_path: inner.config_dir.clone(),
             images_dir: crate::services::storage_service::images_dir(&inner.app),
+            formats_dir: crate::services::storage_service::formats_dir(&inner.app),
             emit: {
                 let inner = Arc::clone(&inner);
                 Box::new(move |status: SyncStatus| inner.publish(status))
@@ -1215,8 +1702,13 @@ async fn run_loop(inner: Arc<Inner>) {
         if let Ok(report) = &cycle {
             // 合并进本地库 / 按墓碑删了本地条目 → 前端列表必须重查。
             // 在 applying 窗口内 emit：监听回调会忽略它（不会引发再同步），
-            // 但前端 WebView 照常收到，列表因此立刻刷新
-            if report.inserted > 0 || report.deleted > 0 {
+            // 但前端 WebView 照常收到，列表因此立刻刷新。
+            // 有图片/富文本被跳过时也 emit：前端至少能刷新状态、看到告警。
+            if report.inserted > 0
+                || report.deleted > 0
+                || report.skipped_images > 0
+                || report.skipped_formats > 0
+            {
                 let _ = inner
                     .app
                     .emit(CLIPBOARD_CHANGED, serde_json::json!({"action": "synced"}));
@@ -1225,7 +1717,7 @@ async fn run_loop(inner: Arc<Inner>) {
         inner.applying.store(false, Ordering::SeqCst);
 
         match cycle {
-            Ok(_report) => {
+            Ok(report) => {
                 // 周期结束已落盘：设备 ID 与同步时间以 state 文件为准
                 let st = state::load_or_init(&inner.config_dir);
                 device_id = st.device_id;
@@ -1240,17 +1732,19 @@ async fn run_loop(inner: Arc<Inner>) {
                     last_sync_at,
                     last_error: None,
                     pending: 0,
+                    warning: sync_warning(report.skipped_images, report.skipped_formats),
+                    skipped: report.skipped_images + report.skipped_formats,
                 });
             }
             Err(e) => {
                 publish_error(&inner, &device_id, last_sync_at, e.to_string());
-                wait(&inner, retry_interval).await;
+                wait_retry(&inner, &cfg).await;
                 continue;
             }
         }
 
         // 8. 等下一轮：定时器与唤醒信号二选一
-        wait(&inner, interval).await;
+        wait_next(&inner, &cfg).await;
     }
 }
 
@@ -1396,6 +1890,9 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// 单连接内存库：内存库按连接隔离，必须锁死 1 个连接。
+    ///
+    /// 001 只有基础列，`html_path`/`rtf_path` 由 003 追加（生产路径走
+    /// `lib.rs::apply_rich_format_columns`）；测试直接照抄那两条 ALTER。
     async fn memory_pool() -> SqlitePool {
         let pool = sqlx::sqlite::SqlitePoolOptions::new()
             .max_connections(1)
@@ -1406,6 +1903,12 @@ mod tests {
             .execute(&pool)
             .await
             .expect("建 items 表");
+        for ddl in [
+            "ALTER TABLE items ADD COLUMN html_path TEXT",
+            "ALTER TABLE items ADD COLUMN rtf_path TEXT",
+        ] {
+            sqlx::query(ddl).execute(&pool).await.expect("加富文本列");
+        }
         pool
     }
 
@@ -1423,6 +1926,7 @@ mod tests {
             settings: SyncSettings::default(),
             state_path: dir.to_path_buf(),
             images_dir: dir.join("images"),
+            formats_dir: dir.join("formats"),
             emit: Box::new(|_status| {}),
         }
     }
@@ -1576,6 +2080,34 @@ mod tests {
         assert_eq!(poll_interval(&cfg), Duration::from_secs(300));
     }
 
+    /// 仅启动时模式**没有定时器**：`next_wait` 返回 None，循环只等唤醒信号；
+    /// 轮询模式仍返回 `poll_interval_sec`。
+    #[test]
+    fn sync_mode_startup_has_no_timer() {
+        let startup = SyncSettings {
+            sync_mode: SyncMode::Startup,
+            ..Default::default()
+        };
+        assert_eq!(next_wait(&startup), None, "startup 不设定时器");
+
+        let interval = SyncSettings {
+            poll_interval_sec: 5,
+            ..Default::default()
+        };
+        assert_eq!(
+            next_wait(&interval),
+            Some(Duration::from_secs(5)),
+            "interval 按 poll_interval_sec 定时"
+        );
+    }
+
+    /// 仅启动时模式下，`clipboard-changed` / `item-deleted` 不得唤醒同步。
+    #[test]
+    fn wake_events_are_ignored_in_startup_mode() {
+        assert!(!should_wake(SyncMode::Startup), "startup 事件不唤醒");
+        assert!(should_wake(SyncMode::Interval), "interval 事件立即唤醒");
+    }
+
     #[tokio::test]
     async fn sensitive_content_never_reaches_backend() {
         let backend = Arc::new(MockBackend::default());
@@ -1647,6 +2179,358 @@ mod tests {
         assert_eq!(content, "[图片]");
         let got = std::fs::read(&file_path).expect("B 的图片文件应已落盘");
         assert_eq!(got, bytes, "图片字节应逐字节一致");
+    }
+
+    /// 接收端目标文件是 0 字节（上次落盘被打断）→ 必须删掉重下。
+    /// "文件已存在就早退"会把这张图永久留在坏状态：行有了、图是空的。
+    #[tokio::test]
+    async fn insert_image_redownloads_zero_byte_target() {
+        let backend = Arc::new(MockBackend::default());
+        let dir_a = temp_dir();
+        let dir_b = temp_dir();
+        let a = make_ctx(Arc::clone(&backend), &dir_a).await;
+        let b = make_ctx(Arc::clone(&backend), &dir_b).await;
+
+        let hash = "00112233445566778899aabbccddeeff";
+        let bytes: Vec<u8> = (0u8..32).collect();
+        std::fs::create_dir_all(&a.images_dir).expect("建 A 的 images 目录");
+        let path_a = a.images_dir.join(format!("{hash}.png"));
+        std::fs::write(&path_a, &bytes).expect("写图片");
+        insert_image_row(&a.db, hash, &path_a.to_string_lossy()).await;
+
+        let ra = run_cycle(&a).await.expect("A 周期");
+        assert_eq!(ra.skipped_images, 0, "发送端不该丢图");
+        assert!(backend.exists(&format!("blobs/{hash}.bin")));
+
+        // B 本地留一个 0 字节残骸：复用它就会永远坏着
+        std::fs::create_dir_all(&b.images_dir).expect("建 B 的 images 目录");
+        // 接收端按 `hash 前 16 位` 命名（与 clipboard_monitor::save_image_to_disk 一致）
+        let target = b.images_dir.join(format!("{}.png", &hash[..16]));
+        std::fs::write(&target, b"").expect("写 0 字节残骸");
+        assert_eq!(std::fs::metadata(&target).unwrap().len(), 0);
+
+        let rb = run_cycle(&b).await.expect("B 周期");
+        assert_eq!(rb.inserted, 1, "0 字节残骸必须被重下覆盖");
+        assert_eq!(rb.skipped_images, 0, "重下成功不该计入跳过");
+        assert_eq!(
+            std::fs::read(&target).expect("读回 B 的图片"),
+            bytes,
+            "字节应与 A 完全一致"
+        );
+
+        // 再跑一轮：行已存在，不重复插入、也不再重下
+        let rb2 = run_cycle(&b).await.expect("B 第二轮");
+        assert_eq!(rb2.inserted, 0);
+        assert_eq!(count_hash(&b.db, hash).await, 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // 富文本副本（HTML / RTF 原始字节）
+    // -----------------------------------------------------------------------
+
+    /// 插入一条带富文本副本的文本条目（路径为绝对路径，与真实采集一致）。
+    async fn insert_rich_text_row(
+        db: &SqlitePool,
+        hash: &str,
+        content: &str,
+        html: &Path,
+        rtf: &Path,
+    ) {
+        sqlx::query(
+            "INSERT INTO items (type, content, content_hash, preview, html_path, rtf_path)
+             VALUES (0, ?, ?, NULL, ?, ?)",
+        )
+        .bind(content)
+        .bind(hash)
+        .bind(html.to_string_lossy().to_string())
+        .bind(rtf.to_string_lossy().to_string())
+        .execute(db)
+        .await
+        .expect("插入富文本条目");
+    }
+
+    /// A 的文本 + html/rtf 原始字节 → 加密 blob → B 落盘，字节逐字节一致。
+    #[tokio::test]
+    async fn rich_text_round_trip_between_two_devices() {
+        let backend = Arc::new(MockBackend::default());
+        let dir_a = temp_dir();
+        let dir_b = temp_dir();
+        let a = make_ctx(Arc::clone(&backend), &dir_a).await;
+        let b = make_ctx(Arc::clone(&backend), &dir_b).await;
+
+        // CF_HTML 包装 + 带 \bin 段的 RTF：都必须原样搬运（不解析、不 sanitize）
+        let html: Vec<u8> =
+            b"Version:0.9\r\nStartHTML:0000000105\r\n<html><body>\xe4\xbd\xa0\xe5\xa5\xbd</body></html>"
+                .to_vec();
+        let rtf: Vec<u8> = b"{\\rtf1\\ansi\\bin4 abcd\\par hi}".to_vec();
+        let hash = "11112222333344445555666677778888";
+
+        std::fs::create_dir_all(&a.formats_dir).expect("建 A 的 formats 目录");
+        let html_path = a.formats_dir.join(format!("{}.html", &hash[..16]));
+        let rtf_path = a.formats_dir.join(format!("{}.rtf", &hash[..16]));
+        std::fs::write(&html_path, &html).expect("写 html");
+        std::fs::write(&rtf_path, &rtf).expect("写 rtf");
+        insert_rich_text_row(&a.db, hash, "带格式的文本", &html_path, &rtf_path).await;
+
+        let ra = run_cycle(&a).await.expect("A 周期");
+        assert!(ra.uploaded);
+        assert_eq!(ra.skipped_formats, 0, "发送端不该丢格式");
+        assert!(
+            backend.exists(&format!("blobs/{}.bin", sha256_hex(&html))),
+            "html blob 应以内容 hash 为键上传"
+        );
+        assert!(
+            backend.exists(&format!("blobs/{}.bin", sha256_hex(&rtf))),
+            "rtf blob 应以内容 hash 为键上传"
+        );
+
+        let rb = run_cycle(&b).await.expect("B 周期");
+        assert_eq!(rb.inserted, 1, "B 应插入该条目");
+        assert_eq!(rb.skipped_formats, 0, "富文本必须全部落地");
+        assert_eq!(rb.skipped_images, 0);
+
+        let row: Option<(String, Option<String>, Option<String>)> =
+            sqlx::query_as("SELECT content, html_path, rtf_path FROM items WHERE content_hash = ?")
+                .bind(hash)
+                .fetch_optional(&b.db)
+                .await
+                .expect("查 B 的条目");
+        let (content, b_html, b_rtf) = row.expect("B 应有该条目");
+        assert_eq!(content, "带格式的文本");
+
+        let b_html = b_html.expect("B 的 html_path 必须有值");
+        let b_rtf = b_rtf.expect("B 的 rtf_path 必须有值");
+        let b_formats = std::fs::canonicalize(&b.formats_dir).expect("规范化 B 的 formats 目录");
+        assert!(
+            std::fs::canonicalize(&b_html)
+                .expect("B 的 html 文件应已落盘")
+                .starts_with(&b_formats),
+            "html_path 必须落在 B 自己的 formats 目录内"
+        );
+        assert_eq!(
+            std::fs::read(&b_html).expect("读回 B 的 html"),
+            html,
+            "html 字节必须逐字节一致"
+        );
+        assert_eq!(
+            std::fs::read(&b_rtf).expect("读回 B 的 rtf"),
+            rtf,
+            "rtf 字节必须逐字节一致"
+        );
+    }
+
+    /// blob 键是**内容** hash，不是 record.hash：同文本不同 html 的两条记录
+    /// 各自上传自己的 blob，互不覆盖。
+    #[tokio::test]
+    async fn format_blob_keyed_by_content_hash_not_record_hash() {
+        let backend = Arc::new(MockBackend::default());
+        let dir_a = temp_dir();
+        let dir_b = temp_dir();
+        let a = make_ctx(Arc::clone(&backend), &dir_a).await;
+        let b = make_ctx(Arc::clone(&backend), &dir_b).await;
+
+        let html1: Vec<u8> = b"<html><body>red</body></html>".to_vec();
+        let html2: Vec<u8> = b"<html><body>blue</body></html>".to_vec();
+        let hash1 = "aaaa1111aaaa1111aaaa1111aaaa1111";
+        let hash2 = "bbbb2222bbbb2222bbbb2222bbbb2222";
+
+        std::fs::create_dir_all(&a.formats_dir).expect("建 A 的 formats 目录");
+        let rtf_path = a.formats_dir.join("shared.rtf");
+        std::fs::write(&rtf_path, b"{\\rtf1 shared}").expect("写 rtf");
+        for (hash, html) in [(hash1, &html1), (hash2, &html2)] {
+            let path = a.formats_dir.join(format!("{}.html", &hash[..16]));
+            std::fs::write(&path, html).expect("写 html");
+            insert_rich_text_row(&a.db, hash, "完全相同的正文", &path, &rtf_path).await;
+        }
+
+        let ra = run_cycle(&a).await.expect("A 周期");
+        assert_eq!(ra.skipped_formats, 0);
+
+        let blob1 = format!("blobs/{}.bin", sha256_hex(&html1));
+        let blob2 = format!("blobs/{}.bin", sha256_hex(&html2));
+        assert_ne!(blob1, blob2, "两份不同 html 必须是两个 blob key");
+        assert_ne!(sha256_hex(&html1), hash1, "blob key 与 record.hash 无关");
+        assert!(backend.exists(&blob1) && backend.exists(&blob2));
+
+        // 解密比对：两个对象的内容确实不同
+        let read_plain = |key: &str| -> Vec<u8> {
+            let sealed = backend.get(key).expect("读对象").expect("对象应存在");
+            crypto::open_blob(&KEY, key, &sealed).expect("解密")
+        };
+        assert_eq!(read_plain(&blob1), html1);
+        assert_eq!(read_plain(&blob2), html2);
+
+        // B 两条都落地，且各自的 html 文件内容不同
+        let rb = run_cycle(&b).await.expect("B 周期");
+        assert_eq!(rb.inserted, 2);
+        assert_eq!(rb.skipped_formats, 0);
+        let mut seen: Vec<(String, Vec<u8>)> = Vec::new();
+        for hash in [hash1, hash2] {
+            let path: Option<String> =
+                sqlx::query_scalar("SELECT html_path FROM items WHERE content_hash = ?")
+                    .bind(hash)
+                    .fetch_one(&b.db)
+                    .await
+                    .expect("查 B 的 html_path");
+            let path = path.expect("html_path 必须有值");
+            seen.push((path.clone(), std::fs::read(&path).expect("读 B 的 html")));
+        }
+        assert_eq!(seen[0].1, html1);
+        assert_eq!(seen[1].1, html2);
+        assert_ne!(seen[0].0, seen[1].0, "两条记录各有自己的本地文件");
+    }
+
+    /// 删除条目时把 formats 目录里的副本一起删掉；目录外的文件一个都不许碰。
+    #[tokio::test]
+    async fn delete_local_removes_format_files() {
+        let backend = Arc::new(MockBackend::default());
+        let dir = temp_dir();
+        let ctx = make_ctx(backend, &dir).await;
+        std::fs::create_dir_all(&ctx.formats_dir).expect("建 formats 目录");
+
+        let hash = "cccc3333cccc3333cccc3333cccc3333";
+        let html_path = ctx.formats_dir.join(format!("{}.html", &hash[..16]));
+        let rtf_path = ctx.formats_dir.join(format!("{}.rtf", &hash[..16]));
+        std::fs::write(&html_path, b"<html><body>del</body></html>").expect("写 html");
+        std::fs::write(&rtf_path, b"{\\rtf1 del}").expect("写 rtf");
+        insert_rich_text_row(&ctx.db, hash, "待删除", &html_path, &rtf_path).await;
+
+        // 目录外的文件（守卫必须挡住）
+        let outside = dir.join("outside.html");
+        std::fs::write(&outside, b"<html>keep me</html>").expect("写目录外文件");
+        let hash_out = "dddd4444dddd4444dddd4444dddd4444";
+        insert_rich_text_row(&ctx.db, hash_out, "越界路径", &outside, &outside).await;
+
+        assert!(
+            delete_local(&ctx.db, &ctx.images_dir, &ctx.formats_dir, hash)
+                .await
+                .expect("删除条目"),
+            "应删掉一行"
+        );
+        assert_eq!(count_hash(&ctx.db, hash).await, 0);
+        assert!(!html_path.exists(), "html 副本必须一起删掉");
+        assert!(!rtf_path.exists(), "rtf 副本必须一起删掉");
+
+        assert!(
+            delete_local(&ctx.db, &ctx.images_dir, &ctx.formats_dir, hash_out)
+                .await
+                .expect("删除越界条目")
+        );
+        assert!(outside.exists(), "formats 目录外的文件绝不能被删");
+
+        // 幂等：已删过的 hash 再删返回 false
+        assert!(
+            !delete_local(&ctx.db, &ctx.images_dir, &ctx.formats_dir, hash)
+                .await
+                .expect("重复删除"),
+            "没有该条目时应返回 false"
+        );
+    }
+
+    /// 远端缺 blob（上传失败/被清理）→ 纯文本照常插入，该格式置 NULL 并计数。
+    #[tokio::test]
+    async fn missing_format_blob_still_inserts_text() {
+        let backend = Arc::new(MockBackend::default());
+        let dir_a = temp_dir();
+        let dir_b = temp_dir();
+        let a = make_ctx(Arc::clone(&backend), &dir_a).await;
+        let b = make_ctx(Arc::clone(&backend), &dir_b).await;
+
+        let html: Vec<u8> = b"<html><body>gone</body></html>".to_vec();
+        let rtf: Vec<u8> = b"{\\rtf1 gone}".to_vec();
+        let hash = "eeee5555eeee5555eeee5555eeee5555";
+        std::fs::create_dir_all(&a.formats_dir).expect("建 A 的 formats 目录");
+        let html_path = a.formats_dir.join(format!("{}.html", &hash[..16]));
+        let rtf_path = a.formats_dir.join(format!("{}.rtf", &hash[..16]));
+        std::fs::write(&html_path, &html).expect("写 html");
+        std::fs::write(&rtf_path, &rtf).expect("写 rtf");
+        insert_rich_text_row(&a.db, hash, "缺格式的正文", &html_path, &rtf_path).await;
+
+        run_cycle(&a).await.expect("A 周期");
+        // 模拟 html blob 丢了（上传失败 / 远端被清理）
+        backend
+            .delete(&format!("blobs/{}.bin", sha256_hex(&html)))
+            .expect("删掉 html blob");
+
+        let rb = run_cycle(&b).await.expect("B 周期");
+        assert_eq!(rb.inserted, 1, "纯文本必须照常插入");
+        assert_eq!(rb.skipped_formats, 1, "缺一个格式就计一次");
+
+        let row: Option<(String, Option<String>, Option<String>)> =
+            sqlx::query_as("SELECT content, html_path, rtf_path FROM items WHERE content_hash = ?")
+                .bind(hash)
+                .fetch_optional(&b.db)
+                .await
+                .expect("查 B 的条目");
+        let (content, b_html, b_rtf) = row.expect("条目仍在");
+        assert_eq!(content, "缺格式的正文");
+        assert!(b_html.is_none(), "缺 blob 的格式必须置 NULL");
+        let b_rtf = b_rtf.expect("另一种格式不受影响");
+        assert_eq!(std::fs::read(&b_rtf).expect("读回 rtf"), rtf);
+    }
+
+    /// peer 给的 record.hash 会拼进本地文件名：非 hex 的 hash（如 `../../x`）
+    /// 绝不能把格式文件写到 formats 目录之外 —— 该格式跳过，文本照常插入。
+    #[tokio::test]
+    async fn traversal_like_record_hash_never_writes_format_files() {
+        let backend = Arc::new(MockBackend::default());
+        let dir_a = temp_dir();
+        let dir_b = temp_dir();
+        let a = make_ctx(Arc::clone(&backend), &dir_a).await;
+        let b = make_ctx(Arc::clone(&backend), &dir_b).await;
+
+        let html: Vec<u8> = b"<html><body>evil</body></html>".to_vec();
+        let hash = "ffff6666ffff6666ffff6666ffff6666";
+        std::fs::create_dir_all(&a.formats_dir).expect("建 A 的 formats 目录");
+        let html_path = a.formats_dir.join(format!("{}.html", &hash[..16]));
+        std::fs::write(&html_path, &html).expect("写 html");
+        insert_rich_text_row(&a.db, hash, "正常条目", &html_path, &html_path).await;
+        run_cycle(&a).await.expect("A 周期");
+
+        // 把 A 的快照记录改成恶意 hash 后再让 B 拉：直接构造一条 peer 记录更直接，
+        // 这里用 delete_local 之外的最短路径 —— 手动插一条本地没有的记录不可行，
+        // 所以改成篡改远端对象：解密 → 改 hash → 重新加密写回。
+        let key = format!(
+            "devices/{}.json",
+            state::load_or_init(&a.state_path).device_id
+        );
+        let sealed = backend.get(&key).expect("读 A 的快照").expect("快照存在");
+        let mut snap: Snapshot = crypto::open_json(&KEY, &key, &sealed).expect("解密快照");
+        for rec in &mut snap.records {
+            rec.hash = "../../evil".to_string();
+        }
+        let body = crypto::seal_json(&KEY, &key, &snap).expect("重新加密");
+        backend.put(&key, &body, None).expect("写回快照");
+
+        let rb = run_cycle(&b).await.expect("B 周期");
+        assert_eq!(rb.inserted, 1, "文本照常插入");
+        assert_eq!(rb.skipped_formats, 2, "html 与 rtf 各自跳过（非法 hash）");
+
+        let row: Option<(String, Option<String>)> =
+            sqlx::query_as("SELECT content, html_path FROM items WHERE content_hash = ?")
+                .bind("../../evil")
+                .fetch_optional(&b.db)
+                .await
+                .expect("查 B 的条目");
+        let (content, html_path) = row.expect("条目仍在");
+        assert_eq!(content, "正常条目");
+        assert!(html_path.is_none(), "非法 hash 不得写 html_path");
+        assert!(
+            !dir_b.join("evil.html").exists(),
+            "绝不能把文件写到 formats 目录外"
+        );
+    }
+
+    /// 告警文案：图片与富文本分开说，两者都为 0 时没有告警。
+    #[test]
+    fn warning_mentions_images_and_formats() {
+        assert_eq!(sync_warning(0, 0), None);
+        assert_eq!(sync_warning(3, 0).as_deref(), Some("3 张图片未同步"));
+        assert_eq!(sync_warning(0, 2).as_deref(), Some("2 个富文本未同步"));
+        assert_eq!(
+            sync_warning(3, 2).as_deref(),
+            Some("3 张图片、2 个富文本未同步")
+        );
     }
 
     /// 错口令（错 key）必须整轮显式失败，而且**不许写远端**：
@@ -1776,9 +2660,18 @@ mod tests {
         let second = next_generation(&generation);
         let third = next_generation(&generation);
         assert_eq!((first, second, third), (1, 2, 3), "代次必须单调自增");
-        assert!(!is_latest_generation(&generation, first), "过期事件不该唤醒");
-        assert!(!is_latest_generation(&generation, second), "过期事件不该唤醒");
-        assert!(is_latest_generation(&generation, third), "最后一次事件必须唤醒");
+        assert!(
+            !is_latest_generation(&generation, first),
+            "过期事件不该唤醒"
+        );
+        assert!(
+            !is_latest_generation(&generation, second),
+            "过期事件不该唤醒"
+        );
+        assert!(
+            is_latest_generation(&generation, third),
+            "最后一次事件必须唤醒"
+        );
 
         // 第三次的 400ms 窗口里又来一次：第三次即使已经 sleep 完也不该唤醒
         let fourth = next_generation(&generation);
@@ -1794,7 +2687,10 @@ mod tests {
         let copy = next_generation(&generation);
         let delete = next_generation(&generation);
         assert!(delete > copy, "同一计数器上代次必须递增");
-        assert!(!is_latest_generation(&generation, copy), "先到的事件被后来者覆盖");
+        assert!(
+            !is_latest_generation(&generation, copy),
+            "先到的事件被后来者覆盖"
+        );
         assert!(is_latest_generation(&generation, delete));
     }
 
@@ -1813,7 +2709,11 @@ mod tests {
             "两端空白应去掉"
         );
         assert_eq!(resolve_device_name("", Some("PC-A")), "PC-A");
-        assert_eq!(resolve_device_name("   ", Some("PC-A")), "PC-A", "纯空白等于没填");
+        assert_eq!(
+            resolve_device_name("   ", Some("PC-A")),
+            "PC-A",
+            "纯空白等于没填"
+        );
         assert_eq!(resolve_device_name("", None), "device");
         assert_eq!(
             resolve_device_name("", Some("   ")),
@@ -1824,10 +2724,7 @@ mod tests {
 
     #[test]
     fn device_id_from_key_parses_only_device_objects() {
-        assert_eq!(
-            device_id_from_key("devices/abc-123.json"),
-            Some("abc-123")
-        );
+        assert_eq!(device_id_from_key("devices/abc-123.json"), Some("abc-123"));
         assert_eq!(device_id_from_key("devices/.json"), None);
         assert_eq!(device_id_from_key("blobs/abc.bin"), None);
         assert_eq!(device_id_from_key("devices/sub/abc.json"), None);

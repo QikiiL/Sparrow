@@ -196,4 +196,53 @@ describe('SyncSection · 云同步设置分区', () => {
       })
     );
   });
+
+  it('切换「仅启动时」保存 sync_mode 并隐藏轮询间隔', async () => {
+    const saveNow = vi.fn();
+    const { rerender } = render(<SyncSection settings={settings()} saveNow={saveNow} />);
+
+    // 默认是轮询模式:间隔 Stepper 在
+    expect(screen.getByText('轮询间隔')).toBeTruthy();
+
+    fireEvent.click(screen.getByRole('button', { name: '仅启动时' }));
+
+    await waitFor(() => expect(saveNow).toHaveBeenCalled());
+    const calls = saveNow.mock.calls;
+    const payload = calls[calls.length - 1][0] as AppSettings;
+    expect(payload.sync.sync_mode).toBe('startup');
+    // 整对象覆盖:其它字段不能被这次切换抹掉
+    expect(payload.sync.enabled).toBe(true);
+
+    // 父组件把新设置回传后:轮询间隔消失,改为一行说明
+    rerender(<SyncSection settings={settings({ sync_mode: 'startup' })} saveNow={saveNow} />);
+    await waitFor(() => expect(screen.queryByText('轮询间隔')).toBeNull());
+    expect(screen.getByText(/启动时同步一次，之后不轮询/)).toBeTruthy();
+    // 状态行与手动同步按钮在两种模式下都在
+    expect(screen.getByRole('button', { name: '立即同步' })).toBeTruthy();
+    await waitFor(() => expect(screen.getByText(/已同步/)).toBeTruthy());
+  });
+
+  it('显示后端上报的跳过条目告警', async () => {
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === 'has_sync_secrets') {
+        return Promise.resolve({ webdav_password: false, s3_secret_key: false, passphrase: false });
+      }
+      if (cmd === 'get_sync_status') {
+        return Promise.resolve({
+          state: 'idle',
+          device_id: '',
+          last_sync_at: Date.now(),
+          last_error: null,
+          pending: 0,
+          warning: '3 张图片未同步',
+          skipped: 3,
+        });
+      }
+      return Promise.resolve(null);
+    });
+
+    render(<SyncSection settings={settings()} saveNow={() => {}} />);
+
+    await waitFor(() => expect(screen.getByText(/3 张图片未同步/)).toBeTruthy());
+  });
 });

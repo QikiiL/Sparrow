@@ -7,6 +7,14 @@
 
 export type SyncProvider = 'webdav' | 's3';
 
+/**
+ * 同步方式:
+ * - `interval`(默认):按 `poll_interval_sec` 轮询,本机复制/删除会立即唤醒一轮;
+ * - `startup`:启动后跑一轮,之后不轮询;复制/删除不触发,只有「立即同步」
+ *   或保存设置才会再跑。
+ */
+export type SyncMode = 'interval' | 'startup';
+
 export interface SyncSettings {
   enabled: boolean;
   provider: SyncProvider;
@@ -19,6 +27,7 @@ export interface SyncSettings {
   s3_path_style: boolean;
   root_prefix: string;
   poll_interval_sec: number;
+  sync_mode: SyncMode;
   device_name: string;
   sync_images: boolean;
   max_blob_mb: number;
@@ -32,6 +41,10 @@ export interface SyncStatus {
   last_sync_at: number;
   last_error: string | null;
   pending: number;
+  /** 本周期被跳过的条目告警（图片/富文本），无则为 null */
+  warning?: string | null;
+  /** 被跳过的条目总数（图片 + 富文本） */
+  skipped?: number;
 }
 
 /** `has_sync_secrets` 的返回:哪些凭证已经存进凭据管理器 */

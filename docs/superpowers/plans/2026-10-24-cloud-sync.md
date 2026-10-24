@@ -25,7 +25,8 @@
 - 加密：用户设置同步口令 → Argon2id 派生密钥；口令存 Windows 凭据管理器。
 - 拉取后只写本地 DB，不写系统剪贴板（无回环）。
 - 删除：只同步显式删除/清空（墓碑）；retention/max_items 自动清理不产生墓碑。
-- 不同步：文件路径条目、富文本 HTML/RTF、收藏分组关系。
+- 不同步：文件路径条目、收藏分组关系。
+- **后续增补（2026-10-25）**：富文本 HTML / RTF 副本改为**原始字节无损同步**（快照 `v = 2`，`html_blob`/`html_size`/`rtf_blob`/`rtf_size` + `blobs/{内容hash}.bin`）。不 sanitize、不解析 RTF（`\bin` 段会被破坏）；所有设备共享同一口令，视为同一信任域，HTML 净化只在预览端（`get_rich_preview` + `sandbox=""`）。详见 `docs/CLOUD-SYNC.md` 6.5。
 
 ## 2. 远端布局
 
