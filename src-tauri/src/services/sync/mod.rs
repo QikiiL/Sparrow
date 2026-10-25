@@ -7,6 +7,7 @@
 
 pub mod backend;
 pub mod crypto;
+pub mod dns;
 pub mod merge;
 pub mod s3;
 pub mod service;
@@ -57,10 +58,10 @@ pub fn key_prefix(key: &str) -> &'static str {
 // 放在这里而不是各后端一份，是因为两边的超时/代理/状态码约定必须一致。
 // ---------------------------------------------------------------------------
 
-/// 连接超时 5s；元数据请求 20s；blob 传输 60s（图片可能几 MB）。
+/// 连接超时 5s；元数据请求 20s；blob 传输 20s（单个 blob 失败要快速跳过，不拖 5 分钟）。
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) const META_TIMEOUT: Duration = Duration::from_secs(20);
-pub(crate) const BLOB_TIMEOUT: Duration = Duration::from_secs(60);
+pub(crate) const BLOB_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// 读取 Windows 系统代理（Clash/V2Ray 等写入的 WinINET 设置）。
 ///
@@ -111,6 +112,15 @@ pub(crate) fn is_loopback(host: &str) -> bool {
 
 /// 构造 ureq Agent（连接超时 5s + 总超时 `timeout`，非回环目标走系统代理）。
 ///
+/// **DNS 解析超时 3s。** ureq 自己的 `timeout` / `timeout_connect` **不覆盖 DNS**
+/// （`stream.rs` 里 `TODO: Find a way to apply deadline to DNS lookup.`），
+/// 校园网对 UDP/53 静默丢包时解析能挂几分钟，上层 5 次重试根本没机会开始，
+/// 表现就是一直卡在「同步中」。所以所有请求都挂上 [`dns::TimeoutResolver`]：
+/// 解析超过 3s 直接报 `io::ErrorKind::TimedOut`，ureq 包成 `ErrorKind::Dns`，
+/// 再经 [`transport_error`] 变成**可重试**的 `Network`。
+/// 回环/IP 直连同样走 resolver，`to_socket_addrs` 对 IP 字面量立即返回，无额外开销。
+/// 走代理时解析的是代理地址（通常 `127.0.0.1:port`），同样立即返回。
+///
 /// **重定向：不跟随。** ureq 的 `redirects(n)` 判定是
 /// `history.len() + 1 >= n` 就报 `TooManyRedirects`，所以 `n = 1` 的实际语义是
 /// 「第一个 3xx 直接失败」—— 正是这里要的：3xx 经 [`transport_error`] 映射成
@@ -135,6 +145,7 @@ pub(crate) fn build_agent(host: &str, timeout: Duration) -> ureq::Agent {
         .timeout(timeout)
         .redirects(1)
         .max_idle_connections(0)
+        .resolver(dns::TimeoutResolver::new(dns::DNS_TIMEOUT))
         .https_only(!loopback);
     if !loopback {
         if let Some(proxy) = system_http_proxy() {

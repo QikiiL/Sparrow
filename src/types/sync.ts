@@ -45,6 +45,11 @@ export interface SyncStatus {
   warning?: string | null;
   /** 被跳过的条目总数（图片 + 富文本） */
   skipped?: number;
+  /**
+   * 同步中的进度点，例如「同步条目 3/20」「上传附件 1/4」；仅 `state === 'syncing'`
+   * 时有值，其它状态为 null/缺省。只含阶段名与计数（不含内容、hash、路径）。
+   */
+  phase?: string | null;
 }
 
 /** `has_sync_secrets` 的返回:哪些凭证已经存进凭据管理器 */

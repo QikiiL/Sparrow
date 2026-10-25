@@ -59,6 +59,20 @@ const PEER_GET_ATTEMPTS: u32 = 2;
 /// peer 快照拉取失败后的冷却期：60s 内不再尝试同一个 peer。
 const PEER_RETRY_COOLDOWN_MS: i64 = 60 * 1000;
 
+/// blob（图片 / 富文本副本）GET 的尝试次数：2 次。
+///
+/// 首次全量同步可能涉及成百上千个 blob，远端偶尔会有读不通的对象（写了一半、
+/// 被代理截断）。每个都跑满 5 次尝试（约 17.5s 退避 + 最多 5×20s 超时）会让
+/// 一个周期长时间停在「同步中」。2 次失败就跳过并计入告警，下一轮再来。
+const BLOB_GET_ATTEMPTS: u32 = 2;
+
+/// blob（图片 / 富文本副本）PUT 的尝试次数：2 次。
+///
+/// 与 GET 同理：一张 5MB 的图在坏网络下每次尝试都可能耗掉 20s 超时，5 次就是
+/// 一分半。上传失败**不**中止整轮（文本照常同步、下一轮自动重试），所以快速
+/// 失败比反复重试更划算。
+const BLOB_PUT_ATTEMPTS: u32 = 2;
+
 /// 一次同步周期的全部输入。
 ///
 /// 刻意不持有 `AppHandle`：命令层/循环层（task 4b）负责把 settings、密钥、
@@ -105,6 +119,11 @@ pub struct CycleReport {
     /// 单个 peer 读不通**不**中断整轮：远端多出一个读不通的对象（常见于第三台
     /// 旧设备留下的快照）不该让本机的文本/图片同步一起停摆。
     pub skipped_peers: u32,
+    /// 本轮上传失败的附件（图片 / 富文本副本）blob 数。
+    ///
+    /// 单个 blob 上传失败同样**不**中断整轮：失败的 blob 不写进
+    /// `uploaded_blobs`，下一轮自动重试；快照仍照常上传，文本条目先同步过去。
+    pub upload_failed: u32,
 }
 
 /// 接收端一条图片的落地结果。
@@ -130,10 +149,16 @@ enum InsertOutcome {
 
 /// 跳过时给用户看的告警文案（0 个 → 无告警）。
 ///
-/// 图片、富文本、peer 快照分开说：用户需要知道丢的是"图片"还是"富文本格式"，
-/// 两者处理方式不同（图片是整条没同步，富文本只是退化成纯文本）；而
-/// "设备快照未拉取"意味着**某个设备**的条目这轮没进来，跟本机内容无关。
-fn sync_warning(skipped_images: u32, skipped_formats: u32, skipped_peers: u32) -> Option<String> {
+/// 图片、富文本、peer 快照、附件上传失败分开说：用户需要知道丢的是"图片"还是
+/// "富文本格式"，两者处理方式不同（图片是整条没同步，富文本只是退化成纯文本）；
+/// "设备快照未拉取"意味着**某个设备**的条目这轮没进来，跟本机内容无关；
+/// "附件上传失败"是本机内容没上去（文本已在快照里同步，下一轮重试 blob）。
+fn sync_warning(
+    skipped_images: u32,
+    skipped_formats: u32,
+    skipped_peers: u32,
+    upload_failed: u32,
+) -> Option<String> {
     let mut parts: Vec<String> = Vec::new();
     match (skipped_images, skipped_formats) {
         (0, 0) => {}
@@ -145,6 +170,9 @@ fn sync_warning(skipped_images: u32, skipped_formats: u32, skipped_peers: u32) -
     }
     if skipped_peers > 0 {
         parts.push(format!("{skipped_peers} 个设备快照未拉取"));
+    }
+    if upload_failed > 0 {
+        parts.push(format!("{upload_failed} 个附件上传失败"));
     }
     if parts.is_empty() {
         None
@@ -161,15 +189,10 @@ fn sync_warning(skipped_images: u32, skipped_formats: u32, skipped_peers: u32) -
 pub async fn run_cycle(ctx: &CycleCtx) -> Result<CycleReport, SyncError> {
     let mut st = state::load_or_init(&ctx.state_path);
 
-    (ctx.emit)(SyncStatus {
-        state: "syncing".to_string(),
-        device_id: st.device_id.clone(),
-        last_sync_at: st.last_sync_at,
-        last_error: None,
-        pending: 0,
-        warning: None,
-        skipped: 0,
-    });
+    // 周期的第一个动作就是读设备列表（`cycle_body` 开头）：直接报这个阶段，
+    // 别让 UI 在 `run_loop` 的「连接存储」之后闪一下没有阶段的「同步中…」。
+    // 同一阶段重复 publish 会被 `same_status` 去重，不会多推一次事件。
+    (ctx.emit)(syncing_status(&st, "读取设备列表"));
 
     let outcome = cycle_body(ctx, &mut st).await;
 
@@ -184,8 +207,10 @@ pub async fn run_cycle(ctx: &CycleCtx) -> Result<CycleReport, SyncError> {
                 report.skipped_images,
                 report.skipped_formats,
                 report.skipped_peers,
+                report.upload_failed,
             ),
-            skipped: report.skipped_images + report.skipped_formats,
+            skipped: report.skipped_images + report.skipped_formats + report.upload_failed,
+            phase: None,
         }),
         Err(e) => {
             if let Err(save_err) = st.save(&ctx.state_path) {
@@ -214,6 +239,7 @@ async fn cycle_body(ctx: &CycleCtx, st: &mut SyncStateFile) -> Result<CycleRepor
 
     // 1. 扫远端 peers（LIST + 按 ETag 增量 GET）
     //    单个 peer 读不通只跳过（并记冷却期），不中断整轮
+    (ctx.emit)(syncing_status(st, "读取设备列表"));
     let (snapshots, skipped_peers) = fetch_peer_snapshots(ctx, st).await?;
 
     // 2. 远端墓碑先并入本地状态。`merge::plan_merge` 只看 `tombstones` 参数、
@@ -230,24 +256,38 @@ async fn cycle_body(ctx: &CycleCtx, st: &mut SyncStateFile) -> Result<CycleRepor
     }
 
     // 3. 合并
+    (ctx.emit)(syncing_status(st, "合并设备快照"));
     let local = local_view(&ctx.db).await?;
     let mut inserted = 0usize;
     let mut deleted = 0usize;
     let mut skipped_images: u32 = 0;
     let mut skipped_formats: u32 = 0;
-    for action in merge::plan_merge(&local, &snapshots, &st.tombstones, &st.device_id) {
+    let actions = merge::plan_merge(&local, &snapshots, &st.tombstones, &st.device_id);
+    // 进度分母只数 `Insert`：它们才是这一轮真正耗时的部分（图片/富文本要下载
+    // blob），`Delete` 只是本地删行。先算总数，UI 才不会看到分母一直变。
+    let total = actions
+        .iter()
+        .filter(|action| matches!(action, MergeAction::Insert(_)))
+        .count();
+    let mut i = 0usize;
+    for action in actions {
         match action {
-            MergeAction::Insert(rec) => match insert_record(ctx, &rec).await? {
-                InsertOutcome::Inserted { skipped_formats: n } => {
-                    inserted += 1;
-                    skipped_formats += n;
+            MergeAction::Insert(rec) => {
+                i += 1;
+                // 进度点只带序号与总数：绝不放内容、hash、文件名或路径
+                (ctx.emit)(syncing_status(st, format!("同步条目 {i}/{total}")));
+                match insert_record(ctx, &rec).await? {
+                    InsertOutcome::Inserted { skipped_formats: n } => {
+                        inserted += 1;
+                        skipped_formats += n;
+                    }
+                    InsertOutcome::Ignored => {}
+                    InsertOutcome::ImageSkipped(reason) => {
+                        skipped_images += 1;
+                        eprintln!("sync: skip image {} ({reason})", short_id(&rec.hash));
+                    }
                 }
-                InsertOutcome::Ignored => {}
-                InsertOutcome::ImageSkipped(reason) => {
-                    skipped_images += 1;
-                    eprintln!("sync: skip image {} ({reason})", short_id(&rec.hash));
-                }
-            },
+            }
             MergeAction::Delete(hash) => {
                 if delete_local(&ctx.db, &ctx.images_dir, &ctx.formats_dir, &hash).await? {
                     deleted += 1;
@@ -291,9 +331,14 @@ async fn cycle_body(ctx: &CycleCtx, st: &mut SyncStateFile) -> Result<CycleRepor
     append_tombstone_records(&mut snap, &st.tombstones);
 
     // 6. 上传图片 blob（先 blob 后快照：快照一上去 peer 就会来取 blob）
-    upload_blobs(ctx, st, &snap).await?;
+    //    单个 blob 上传失败不中止整轮：返回失败计数，快照照常上传，
+    //    失败的 blob 下一轮自动重试（否则一张传不上去的大图会让整轮永远 error，
+    //    `last_sync_at` 永不更新，表现为"永远同步不了"）。
+    (ctx.emit)(syncing_status(st, "上传附件"));
+    let upload_failed = upload_blobs(ctx, st, &snap).await?;
 
     // 7. 上传本机快照
+    (ctx.emit)(syncing_status(st, "上传快照"));
     let uploaded = upload_snapshot(ctx, st, &snap).await?;
 
     // 8. 收尾落盘（设备名以本轮实际用上的为准）
@@ -312,6 +357,7 @@ async fn cycle_body(ctx: &CycleCtx, st: &mut SyncStateFile) -> Result<CycleRepor
         skipped_images,
         skipped_formats,
         skipped_peers,
+        upload_failed,
     })
 }
 
@@ -384,11 +430,17 @@ async fn remote_list(ctx: &CycleCtx, prefix: &str) -> Result<Vec<ObjectMeta>, Sy
     io(move || retry("LIST", &key, || backend.list(&key))).await
 }
 
-async fn remote_get(ctx: &CycleCtx, key: &str) -> Result<Option<Vec<u8>>, SyncError> {
-    remote_get_with_attempts(ctx, key, MAX_ATTEMPTS).await
+/// 下载一个 blob（图片 / 富文本副本）。
+///
+/// 与 peer 快照同理：单个 blob 是"这一轮可以不要"的数据，为一个读不通的
+/// 对象等满 [`MAX_ATTEMPTS`] 档退避（约 17.5s）只会把整轮拖住。只试
+/// [`BLOB_GET_ATTEMPTS`] 次（配合 `mod.rs` 的 `BLOB_TIMEOUT`，最坏 2×20s），
+/// 失败就跳过并计入告警，下一轮再试。
+async fn remote_get_blob(ctx: &CycleCtx, key: &str) -> Result<Option<Vec<u8>>, SyncError> {
+    remote_get_with_attempts(ctx, key, BLOB_GET_ATTEMPTS).await
 }
 
-/// 同 [`remote_get`]，可指定尝试次数（peer 快照用 [`PEER_GET_ATTEMPTS`]）。
+/// 按指定尝试次数 GET 一个对象。
 async fn remote_get_with_attempts(
     ctx: &CycleCtx,
     key: &str,
@@ -416,6 +468,28 @@ async fn remote_put(
     io(move || {
         retry("PUT", &key, || {
             backend.put(&key, &body, if_match.as_deref())
+        })
+    })
+    .await
+}
+
+/// 上传一个 blob（图片 / 富文本副本），**无条件** PUT。
+///
+/// 为什么无条件：换口令后必须用新 key 覆盖旧密文，条件写会让 412 把"内容寻址、
+/// 已经存在"误当成"无需上传"，远端就永远留着解不开的旧密文。
+///
+/// 只试 [`BLOB_PUT_ATTEMPTS`] 次：调用方把失败当成"这轮没传上"，计入
+/// `upload_failed` 后跳过，下一轮再试 —— 不为一个 blob 等满 4 档退避。
+async fn remote_put_blob(
+    ctx: &CycleCtx,
+    key: &str,
+    body: Vec<u8>,
+) -> Result<Option<String>, SyncError> {
+    let backend = Arc::clone(&ctx.backend);
+    let key = key.to_string();
+    io(move || {
+        retry_with_attempts("PUT", &key, BLOB_PUT_ATTEMPTS, || {
+            backend.put(&key, &body, None)
         })
     })
     .await
@@ -708,7 +782,7 @@ async fn insert_image(ctx: &CycleCtx, rec: &SyncRecord) -> Result<ImageOutcome, 
         }
         let key = blob_key(&rec.hash);
         // 单张图片的 blob 下载失败不能拖垮整轮：跳过它并计入告警，文本/其它图片照常同步。
-        let sealed = match remote_get(ctx, &key).await {
+        let sealed = match remote_get_blob(ctx, &key).await {
             Ok(Some(bytes)) => bytes,
             Ok(None) => return Ok(ImageOutcome::Skipped("blob 缺失")),
             Err(e) if e.kind == SyncErrorKind::Auth => return Err(e),
@@ -826,7 +900,7 @@ async fn land_format(
 
     let key = blob_key(blob_hash);
     // 单个格式 blob 下载失败只降级该格式（纯文本仍入库），不能中断整轮。
-    let sealed = match remote_get(ctx, &key).await {
+    let sealed = match remote_get_blob(ctx, &key).await {
         Ok(Some(bytes)) => bytes,
         Ok(None) => return Ok(Landed::Skipped("blob 缺失")),
         Err(e) if e.kind == SyncErrorKind::Auth => return Err(e),
@@ -954,13 +1028,37 @@ fn append_tombstone_records(snap: &mut Snapshot, tombstones: &[Tombstone]) {
 ///
 /// 两者共用同一份 `uploaded_blobs` 去重集合 —— 它们都是内容寻址对象，
 /// 键就是内容 hash，落在同一个 `blobs/` 前缀下。
+///
+/// 返回**上传失败的 blob 数**。单个 blob 上传失败（2 次尝试后仍 5xx/超时）
+/// 只跳过它本身：不写进 `uploaded_blobs`（下一轮自动重试）、不中止整轮，
+/// 否则一张传不上去的大图会让整轮永远 error，`last_sync_at` 永不更新。
+/// 只有结构性错误（读库失败等）才返回 `Err`。
 async fn upload_blobs(
     ctx: &CycleCtx,
     st: &mut SyncStateFile,
     snap: &Snapshot,
-) -> Result<(), SyncError> {
+) -> Result<u32, SyncError> {
     let max_bytes = max_blob_bytes(&ctx.settings);
     let mut done: HashSet<String> = st.uploaded_blobs.iter().cloned().collect();
+    let mut failed: u32 = 0;
+
+    // 进度分母：本轮"还没传过"的 blob 数（图片 + 富文本）。先数一遍，
+    // 循环里按同一口径递增，序号才不会跳。
+    let mut total = 0usize;
+    for rec in snap.records.iter().filter(|r| r.deleted_at.is_none()) {
+        if rec.kind == 2 {
+            if !done.contains(&rec.hash) {
+                total += 1;
+            }
+        } else {
+            total += [rec.html_blob.as_deref(), rec.rtf_blob.as_deref()]
+                .into_iter()
+                .flatten()
+                .filter(|hash| !hash.is_empty() && !done.contains(*hash))
+                .count();
+        }
+    }
+    let mut i = 0usize;
 
     // 1. 图片：blob key 就是 record.hash（图片的 content_hash 即文件字节的 hash）
     let images = image_rows(&ctx.db).await?;
@@ -972,6 +1070,9 @@ async fn upload_blobs(
         if done.contains(&rec.hash) {
             continue;
         }
+        i += 1;
+        // 进度点只带序号与总数（不含文件名/路径/hash）
+        (ctx.emit)(syncing_status(st, format!("上传附件 {i}/{total}")));
         let Some(path) = images
             .iter()
             .find(|(hash, _)| hash == &rec.hash)
@@ -991,9 +1092,16 @@ async fn upload_blobs(
 
         let key = blob_key(&rec.hash);
         let sealed = crypto::seal_blob(&ctx.key, &key, &bytes)?;
-        // 无条件 PUT：换口令后必须用新 key 覆盖旧密文，条件写会让 412 把
-        // "内容寻址、已经存在"误当成"无需上传"，远端就永远留着解不开的旧密文。
-        remote_put(ctx, &key, sealed, None).await?;
+        if let Err(e) = remote_put_blob(ctx, &key, sealed).await {
+            // 只记操作名 + hash 前 8 位 + 错误类别；下一轮还会重试
+            eprintln!(
+                "sync: upload blob {} failed kind={}",
+                short_id(&rec.hash),
+                e.kind.as_str()
+            );
+            failed += 1;
+            continue;
+        }
         st.uploaded_blobs.push(rec.hash.clone());
         done.insert(rec.hash.clone());
     }
@@ -1017,11 +1125,32 @@ async fn upload_blobs(
             let Some(blob_hash) = blob_hash else {
                 continue;
             };
-            upload_one_blob(ctx, st, &mut done, blob_hash, path, max_bytes).await?;
+            // 与分母同口径：已在 `done` 里的不占序号（`upload_one_blob` 内部还会再判一次）
+            if done.contains(blob_hash) {
+                continue;
+            }
+            i += 1;
+            (ctx.emit)(syncing_status(st, format!("上传附件 {i}/{total}")));
+            if matches!(
+                upload_one_blob(ctx, st, &mut done, blob_hash, path, max_bytes).await?,
+                BlobUpload::Failed
+            ) {
+                failed += 1;
+            }
         }
     }
 
-    Ok(())
+    Ok(failed)
+}
+
+/// 单个富文本副本 blob 的上传结果。
+enum BlobUpload {
+    /// 已上传（或本来就在 `done` 里）
+    Uploaded,
+    /// 没有可上传的内容（无本地文件 / 超限 / hash 不符）—— 不计上传失败
+    Skipped,
+    /// 远端 PUT 失败（已重试 [`BLOB_PUT_ATTEMPTS`] 次）—— 计入 `upload_failed`
+    Failed,
 }
 
 /// 上传一个富文本副本 blob。
@@ -1036,43 +1165,50 @@ async fn upload_one_blob(
     blob_hash: &str,
     path: Option<&str>,
     max_bytes: u64,
-) -> Result<(), SyncError> {
+) -> Result<BlobUpload, SyncError> {
     if done.contains(blob_hash) {
-        return Ok(());
+        return Ok(BlobUpload::Uploaded);
     }
     if !is_blob_hash(blob_hash) {
         eprintln!("sync: skip format blob {} (hash 非法)", short_id(blob_hash));
-        return Ok(());
+        return Ok(BlobUpload::Skipped);
     }
     let Some(path) = path else {
         eprintln!(
             "sync: skip format blob {} (无本地文件)",
             short_id(blob_hash)
         );
-        return Ok(());
+        return Ok(BlobUpload::Skipped);
     };
     let Some(bytes) = read_blob_file(path, max_bytes).await? else {
         eprintln!(
             "sync: skip format blob {} (文件缺失或超过大小上限)",
             short_id(blob_hash)
         );
-        return Ok(());
+        return Ok(BlobUpload::Skipped);
     };
     if sha256_hex(&bytes) != blob_hash {
         eprintln!(
             "sync: skip format blob {} (内容与 hash 不符)",
             short_id(blob_hash)
         );
-        return Ok(());
+        return Ok(BlobUpload::Skipped);
     }
 
     let key = blob_key(blob_hash);
     let sealed = crypto::seal_blob(&ctx.key, &key, &bytes)?;
-    // 无条件 PUT，理由同图片 blob
-    remote_put(ctx, &key, sealed, None).await?;
+    // 无条件 PUT，理由同图片 blob；失败只跳过这一个 blob（下一轮重试）
+    if let Err(e) = remote_put_blob(ctx, &key, sealed).await {
+        eprintln!(
+            "sync: upload blob {} failed kind={}",
+            short_id(blob_hash),
+            e.kind.as_str()
+        );
+        return Ok(BlobUpload::Failed);
+    }
     st.uploaded_blobs.push(blob_hash.to_string());
     done.insert(blob_hash.to_string());
-    Ok(())
+    Ok(BlobUpload::Uploaded)
 }
 
 /// `SELECT content_hash, file_path FROM items WHERE type = 2`。
@@ -1327,6 +1463,7 @@ fn same_status(a: &SyncStatus, b: &SyncStatus) -> bool {
         && a.pending == b.pending
         && a.warning == b.warning
         && a.skipped == b.skipped
+        && a.phase == b.phase
 }
 
 /// 同步服务的运行句柄。由 `lib.rs` 在 setup 里 `app.manage`。
@@ -1528,6 +1665,23 @@ fn device_name_or_computer_name(configured: &str) -> String {
     resolve_device_name(configured, std::env::var("COMPUTERNAME").ok().as_deref())
 }
 
+/// 构造 `syncing` 状态（进度点由调用方给）。
+///
+/// 周期里会报很多次 `syncing`，每处手写一遍六七个字段既啰嗦又容易漏；
+/// `phase` 只放阶段名与计数，绝不放内容 / hash / 路径。
+fn syncing_status(st: &SyncStateFile, phase: impl Into<String>) -> SyncStatus {
+    SyncStatus {
+        state: STATE_SYNCING.to_string(),
+        device_id: st.device_id.clone(),
+        last_sync_at: st.last_sync_at,
+        last_error: None,
+        pending: 0,
+        warning: None,
+        skipped: 0,
+        phase: Some(phase.into()),
+    }
+}
+
 /// 初始状态：未启用 → `disabled`，否则 `idle`（还没跑过任何周期）。
 fn initial_status(cfg: &SyncSettings, st: &SyncStateFile) -> SyncStatus {
     SyncStatus {
@@ -1543,6 +1697,7 @@ fn initial_status(cfg: &SyncSettings, st: &SyncStateFile) -> SyncStatus {
         pending: 0,
         warning: None,
         skipped: 0,
+        phase: None,
     }
 }
 
@@ -1632,6 +1787,7 @@ fn publish_error(inner: &Inner, device_id: &str, last_sync_at: i64, message: Str
         pending: 1,
         warning: None,
         skipped: 0,
+        phase: None,
     });
 }
 
@@ -1690,6 +1846,7 @@ async fn run_loop(inner: Arc<Inner>) {
                 pending: 0,
                 warning: None,
                 skipped: 0,
+                phase: None,
             });
             // 未启用分支仍用 2s 的轻量配置轮询（理由见 DISABLED_POLL）
             wait(&inner, DISABLED_POLL).await;
@@ -1705,6 +1862,7 @@ async fn run_loop(inner: Arc<Inner>) {
             pending: 0,
             warning: None,
             skipped: 0,
+            phase: None,
         });
 
         // 3. 凭证（keyring / 环境变量，阻塞 API → 线程池）
@@ -1738,6 +1896,13 @@ async fn run_loop(inner: Arc<Inner>) {
         }
 
         // 4. 后端 + meta + 密钥（阻塞池）
+        //    这一步要建目录（WebDAV MKCOL）+ 读 meta + 跑 Argon2id，是最容易
+        //    "看起来卡住"的阶段，先报给 UI；device_id/last_sync_at 以磁盘上的
+        //    state 为准（与下面周期收尾时的取值口径一致）。
+        inner.publish(syncing_status(
+            &state::load_or_init(&inner.config_dir),
+            "连接存储",
+        ));
         let cached = inner.key_cache.lock().await.clone();
         let ensure_fp = ensure_fingerprint(&cfg);
         let need_ensure = last_ensured.as_deref() != Some(ensure_fp.as_str());
@@ -1891,8 +2056,10 @@ async fn run_loop(inner: Arc<Inner>) {
                         report.skipped_images,
                         report.skipped_formats,
                         report.skipped_peers,
+                        report.upload_failed,
                     ),
-                    skipped: report.skipped_images + report.skipped_formats,
+                    skipped: report.skipped_images + report.skipped_formats + report.upload_failed,
+                    phase: None,
                 });
             }
             Err(e) => {
@@ -1932,8 +2099,12 @@ mod tests {
         seq: AtomicUsize,
         /// 这些 key 的 GET 永远返回 5xx（模拟远端读不通的坏对象）
         get_failures: Mutex<HashSet<String>>,
+        /// 这些 key 的 PUT 永远返回 5xx（模拟上传不上去的大对象）
+        put_failures: Mutex<HashSet<String>>,
         /// 每个 key 各被 GET 了多少次（断言冷却期"没再请求"）
         gets_by_key: Mutex<HashMap<String, usize>>,
+        /// 每个 key 各被 PUT 了多少次（断言 blob PUT 的尝试次数）
+        puts_by_key: Mutex<HashMap<String, usize>>,
     }
 
     impl MockBackend {
@@ -1954,9 +2125,29 @@ mod tests {
             self.get_failures.lock().unwrap().insert(key.to_string());
         }
 
+        /// 让某个 key 的 PUT 一直返回 5xx。
+        fn fail_put(&self, key: &str) {
+            self.put_failures.lock().unwrap().insert(key.to_string());
+        }
+
+        /// 恢复某个 key 的 PUT（模拟网络恢复，下一轮就能传上去了）。
+        fn allow_put(&self, key: &str) {
+            self.put_failures.lock().unwrap().remove(key);
+        }
+
         /// 某个 key 的 GET 次数。
         fn gets_for(&self, key: &str) -> usize {
             self.gets_by_key
+                .lock()
+                .unwrap()
+                .get(key)
+                .copied()
+                .unwrap_or(0)
+        }
+
+        /// 某个 key 的 PUT 次数。
+        fn puts_for(&self, key: &str) -> usize {
+            self.puts_by_key
                 .lock()
                 .unwrap()
                 .get(key)
@@ -1993,6 +2184,15 @@ mod tests {
             if_match: Option<&str>,
         ) -> Result<Option<String>, SyncError> {
             self.puts.fetch_add(1, Ordering::SeqCst);
+            *self
+                .puts_by_key
+                .lock()
+                .unwrap()
+                .entry(key.to_string())
+                .or_insert(0) += 1;
+            if self.put_failures.lock().unwrap().contains(key) {
+                return Err(SyncError::server("PUT 失败: status=503"));
+            }
             let mut objects = self.objects.lock().unwrap();
             if let Some(expected) = if_match {
                 if expected == "*" {
@@ -2200,7 +2400,14 @@ mod tests {
         });
 
         run_cycle(&ctx).await.expect("周期");
-        assert_eq!(*seen.lock().unwrap(), vec!["syncing", "idle"]);
+        // 周期内会多次上报 `syncing`（每个阶段一个进度点），最后必须以 `idle` 收尾
+        let states = seen.lock().unwrap().clone();
+        assert!(states.len() >= 2, "至少要报 syncing 与 idle: {states:?}");
+        assert_eq!(states.last().map(String::as_str), Some("idle"), "收尾必须是 idle");
+        assert!(
+            states[..states.len() - 1].iter().all(|s| s == "syncing"),
+            "中途只允许 syncing: {states:?}"
+        );
     }
 
     #[tokio::test]
@@ -2719,22 +2926,86 @@ mod tests {
         );
     }
 
-    /// 告警文案：图片与富文本分开说，两者都为 0 时没有告警。
+    /// 告警文案：图片、富文本、peer 快照、附件上传失败分开说，都为 0 时没有告警。
     #[test]
     fn warning_mentions_images_and_formats() {
-        assert_eq!(sync_warning(0, 0, 0), None);
-        assert_eq!(sync_warning(3, 0, 0).as_deref(), Some("3 张图片未同步"));
-        assert_eq!(sync_warning(0, 2, 0).as_deref(), Some("2 个富文本未同步"));
+        assert_eq!(sync_warning(0, 0, 0, 0), None);
+        assert_eq!(sync_warning(3, 0, 0, 0).as_deref(), Some("3 张图片未同步"));
         assert_eq!(
-            sync_warning(3, 2, 0).as_deref(),
+            sync_warning(0, 2, 0, 0).as_deref(),
+            Some("2 个富文本未同步")
+        );
+        assert_eq!(
+            sync_warning(3, 2, 0, 0).as_deref(),
             Some("3 张图片、2 个富文本未同步")
         );
         // peer 快照没拉到时也要说清楚是"某个设备"，而不是本机内容丢了
-        assert_eq!(sync_warning(0, 0, 1).as_deref(), Some("1 个设备快照未拉取"));
         assert_eq!(
-            sync_warning(1, 1, 2).as_deref(),
+            sync_warning(0, 0, 1, 0).as_deref(),
+            Some("1 个设备快照未拉取")
+        );
+        assert_eq!(
+            sync_warning(1, 1, 2, 0).as_deref(),
             Some("1 张图片、1 个富文本未同步；2 个设备快照未拉取")
         );
+        // 附件上传失败是本机内容没上去（文本已在快照里），单独一句
+        assert_eq!(
+            sync_warning(0, 0, 0, 1).as_deref(),
+            Some("1 个附件上传失败")
+        );
+        assert_eq!(
+            sync_warning(1, 1, 1, 2).as_deref(),
+            Some("1 张图片、1 个富文本未同步；1 个设备快照未拉取；2 个附件上传失败")
+        );
+    }
+
+    /// 单个附件上传失败不能中止整轮：快照仍要上传，失败的 blob 下一轮自动补上。
+    #[tokio::test]
+    async fn blob_upload_failure_does_not_block_cycle() {
+        let backend = Arc::new(MockBackend::default());
+        let dir = temp_dir();
+        let a = make_ctx(Arc::clone(&backend), &dir).await;
+
+        insert_text(&a.db, "先同步过去的文本", "text1").await;
+        let hash = "ffeeddccbbaa00998877665544332211";
+        let bytes: Vec<u8> = (0u8..24).collect();
+        std::fs::create_dir_all(&a.images_dir).expect("建 images 目录");
+        let path_a = a.images_dir.join(format!("{}.png", &hash[..16]));
+        std::fs::write(&path_a, &bytes).expect("写图片");
+        insert_image_row(&a.db, hash, &path_a.to_string_lossy()).await;
+
+        let key = format!("blobs/{hash}.bin");
+        backend.fail_put(&key);
+
+        let ra = run_cycle(&a)
+            .await
+            .expect("单个 blob 上传失败不该让整轮失败");
+        assert_eq!(ra.upload_failed, 1, "失败的 blob 要计入 upload_failed");
+        assert!(ra.uploaded, "有 blob 失败时快照仍要上传");
+        let device_id = state::load_or_init(&a.state_path).device_id;
+        assert!(
+            backend.exists(&format!("devices/{device_id}.json")),
+            "文本快照必须照常上传（下一轮才补图片）"
+        );
+        let st = state::load_or_init(&a.state_path);
+        assert!(
+            !st.uploaded_blobs.contains(&hash.to_string()),
+            "失败的 blob 绝不能记成已上传，否则永远不会重试"
+        );
+        // blob PUT 快速失败：只试 2 次（BLOB_PUT_ATTEMPTS），不是 5 次
+        assert_eq!(backend.puts_for(&key), 2, "单个失败 blob 只发起 2 次 PUT");
+
+        // 网络恢复 → 下一轮把漏掉的 blob 补上
+        backend.allow_put(&key);
+        let ra2 = run_cycle(&a).await.expect("第二轮");
+        assert_eq!(ra2.upload_failed, 0, "恢复后不该再有失败");
+        assert!(
+            state::load_or_init(&a.state_path)
+                .uploaded_blobs
+                .contains(&hash.to_string()),
+            "第二轮必须补传成功的 hash"
+        );
+        assert!(backend.exists(&key), "远端最终要有这个 blob");
     }
 
     /// 单个图片 blob 下载失败不能拖垮整轮：文本仍要落库，图片计入 skipped。
@@ -2761,6 +3032,80 @@ mod tests {
         assert_eq!(rb.skipped_images, 1, "图片应计入 skipped");
         assert_eq!(count_hash(&b.db, "text1").await, 1, "文本仍应插入");
         assert_eq!(count_hash(&b.db, hash).await, 0, "坏图片不应插入");
+        // blob GET 快速失败：只试 2 次（BLOB_GET_ATTEMPTS），不是 5 次。
+        // 否则首次全量同步遇到几个坏对象就会在「同步中」停很久（每次 20s 超时）。
+        assert_eq!(
+            backend.gets_for(&format!("blobs/{hash}.bin")),
+            2,
+            "单个坏 blob 只发起 2 次 GET"
+        );
+    }
+
+    /// 进度点：`syncing` 期间按阶段上报，序号/总数只含计数（不含内容、hash、路径）。
+    #[tokio::test]
+    async fn syncing_reports_progress_phases() {
+        let backend = Arc::new(MockBackend::default());
+        let dir = temp_dir();
+        let seen: Arc<Mutex<Vec<Option<String>>>> = Arc::new(Mutex::new(Vec::new()));
+        let log = Arc::clone(&seen);
+        let mut ctx = make_ctx(Arc::clone(&backend), &dir).await;
+        ctx.emit = Box::new(move |status: SyncStatus| {
+            log.lock().unwrap().push(status.phase);
+        });
+        insert_text(&ctx.db, "进度点", "h1").await;
+
+        run_cycle(&ctx).await.expect("周期");
+
+        // 连续重复的阶段在 `Inner::publish` 里会被 `same_status` 去重，
+        // 这里用同样的口径折叠（`run_cycle` 与 `cycle_body` 都报「读取设备列表」）。
+        let mut phases: Vec<String> = Vec::new();
+        for phase in seen.lock().unwrap().iter().flatten() {
+            if phases.last() != Some(phase) {
+                phases.push(phase.clone());
+            }
+        }
+        assert_eq!(
+            phases,
+            vec!["读取设备列表", "合并设备快照", "上传附件", "上传快照"],
+            "没有 peer、没有 blob 时也要按阶段报进度"
+        );
+    }
+
+    /// 合并与上传的计数进度：`同步条目 i/n` 与 `上传附件 i/n` 的分母必须稳定。
+    #[tokio::test]
+    async fn progress_counts_items_and_blobs() {
+        let backend = Arc::new(MockBackend::default());
+        let dir_a = temp_dir();
+        let dir_b = temp_dir();
+        let a = make_ctx(Arc::clone(&backend), &dir_a).await;
+        let mut b = make_ctx(Arc::clone(&backend), &dir_b).await;
+
+        insert_text(&a.db, "进度点的文本", "text1").await;
+        let hash = "aabbccdd00112233aabbccdd00112233";
+        let bytes: Vec<u8> = (0u8..8).collect();
+        std::fs::create_dir_all(&a.images_dir).expect("建 images 目录");
+        let path_a = a.images_dir.join(format!("{}.png", &hash[..16]));
+        std::fs::write(&path_a, &bytes).expect("写图片");
+        insert_image_row(&a.db, hash, &path_a.to_string_lossy()).await;
+        run_cycle(&a).await.expect("A 周期");
+
+        let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let log = Arc::clone(&seen);
+        b.emit = Box::new(move |status: SyncStatus| {
+            if let Some(phase) = status.phase {
+                log.lock().unwrap().push(phase);
+            }
+        });
+        let rb = run_cycle(&b).await.expect("B 周期");
+        assert_eq!(rb.inserted, 2, "文本 + 图片都要落地");
+
+        let phases = seen.lock().unwrap().clone();
+        // 分母只数 Insert：2 条记录 → 1/2、2/2（不把 Delete 算进总数）
+        assert!(phases.contains(&"同步条目 1/2".to_string()), "{phases:?}");
+        assert!(phases.contains(&"同步条目 2/2".to_string()), "{phases:?}");
+        // B 自己的快照里那张图还没传过 → 上传附件 1/1
+        assert!(phases.contains(&"上传附件 1/1".to_string()), "{phases:?}");
+        assert!(phases.contains(&"上传快照".to_string()), "{phases:?}");
     }
 
     /// 错口令（错 key）必须整轮显式失败，而且**不许写远端**：

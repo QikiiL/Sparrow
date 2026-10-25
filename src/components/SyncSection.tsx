@@ -308,9 +308,12 @@ export function SyncSection({ settings, saveNow }: Props) {
 
   const state = status?.state ?? 'disabled';
   const tone = state === 'error' ? 'danger' : state === 'syncing' ? 'warn' : state === 'idle' ? 'ok' : 'idle';
+  // 同步中优先显示后端给的进度点(阶段名 + 计数),没有就退回笼统的「同步中…」
   const statusText =
     state === 'syncing'
-      ? '同步中…'
+      ? status?.phase
+        ? `同步中 · ${status.phase}`
+        : '同步中…'
       : state === 'error'
         ? `错误：${status?.last_error || '未知错误'}`
         : state === 'idle'

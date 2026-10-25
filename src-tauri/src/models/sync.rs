@@ -100,9 +100,17 @@ pub struct SyncStatus {
     /// 或旧版本状态载荷缺字段时仍能解析。
     #[serde(default)]
     pub warning: Option<String>,
-    /// 本轮被跳过的图片数（与 `warning` 成对出现）。
+    /// 本轮被跳过的条目数（与 `warning` 成对出现）：下载跳过的图片/富文本 +
+    /// 上传失败的附件 blob。上传失败不阻断整轮，下一轮自动重试。
     #[serde(default)]
     pub skipped: u32,
+    /// 当前进度点（如「同步条目 3/20」「上传附件 1/4」），只在 `state = syncing`
+    /// 时有值，其它状态一律 `None`。
+    ///
+    /// 只放**阶段名 + 计数**：绝不放条目内容、hash、文件名或路径（日志/事件
+    /// 的脱敏纪律同样适用于上报给前端的状态）。
+    #[serde(default)]
+    pub phase: Option<String>,
 }
 
 /// 快照里的一条记录（= 一条剪贴板条目在远端的形态）。
@@ -232,11 +240,13 @@ mod tests {
             pending: 0,
             warning: None,
             skipped: 0,
+            phase: None,
         };
         let value = serde_json::to_value(&status).expect("序列化状态");
         assert!(value.get("warning").is_some(), "必须含 warning 字段");
         assert!(value["warning"].is_null(), "默认无告警应为 null");
         assert_eq!(value["skipped"], 0);
+        assert!(value["phase"].is_null(), "非同步中不应有进度点");
 
         let warned = SyncStatus {
             warning: Some("3 张图片未同步".to_string()),
@@ -246,6 +256,23 @@ mod tests {
         let value = serde_json::to_value(&warned).expect("序列化状态");
         assert_eq!(value["warning"], "3 张图片未同步");
         assert_eq!(value["skipped"], 3);
+    }
+
+    /// 进度点要能序列化给前端（`phase` 字段名与 `types/sync.ts` 同形）。
+    #[test]
+    fn sync_status_serializes_phase() {
+        let status = SyncStatus {
+            state: "syncing".to_string(),
+            device_id: "dev-1".to_string(),
+            last_sync_at: 0,
+            last_error: None,
+            pending: 0,
+            warning: None,
+            skipped: 0,
+            phase: Some("同步条目 3/20".to_string()),
+        };
+        let value = serde_json::to_value(&status).expect("序列化状态");
+        assert_eq!(value["phase"], "同步条目 3/20");
     }
 
     /// 同步方式：缺字段 → interval；显式 `"startup"` → Startup；序列化小写。

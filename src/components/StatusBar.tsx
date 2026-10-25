@@ -205,7 +205,12 @@ export function StatusBar() {
                     ? 'bg-danger'
                     : 'bg-ok'
               }`}
-              title={syncStatus.last_error || syncStatus.warning || '已同步'}
+              title={
+                // 同步中优先显示后端上报的进度点(如「同步条目 3/20」),否则退回笼统文案
+                syncStatus.state === 'syncing'
+                  ? syncStatus.phase || '同步中…'
+                  : syncStatus.last_error || syncStatus.warning || '已同步'
+              }
             />
           </div>
         )}

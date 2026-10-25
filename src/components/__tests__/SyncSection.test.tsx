@@ -245,4 +245,29 @@ describe('SyncSection · 云同步设置分区', () => {
 
     await waitFor(() => expect(screen.getByText(/3 张图片未同步/)).toBeTruthy());
   });
+
+  it('同步中显示后端上报的进度点(phase)', async () => {
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === 'has_sync_secrets') {
+        return Promise.resolve({ webdav_password: false, s3_secret_key: false, passphrase: false });
+      }
+      if (cmd === 'get_sync_status') {
+        return Promise.resolve({
+          state: 'syncing',
+          device_id: '',
+          last_sync_at: 0,
+          last_error: null,
+          pending: 0,
+          phase: '同步条目 3/20',
+        });
+      }
+      return Promise.resolve(null);
+    });
+
+    render(<SyncSection settings={settings()} saveNow={() => {}} />);
+
+    // 进度点替换掉笼统的「同步中…」:用户能看到首次全量同步走到哪一步
+    await waitFor(() => expect(screen.getByText('同步中 · 同步条目 3/20')).toBeTruthy());
+    expect(screen.queryByText('同步中…')).toBeNull();
+  });
 });
