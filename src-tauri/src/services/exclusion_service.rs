@@ -155,8 +155,14 @@ static RE_GITHUB_TOKEN: LazyLock<Regex> = LazyLock::new(|| {
 static RE_SLACK_TOKEN: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b").unwrap());
 
-/// OpenAI 等服务的 sk- 前缀密钥
-static RE_SK_KEY: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\bsk-[A-Za-z0-9]{20,}\b").unwrap());
+/// OpenAI 等服务的 sk- 前缀密钥。
+///
+/// 正文允许 `-` 与 `_`:现代格式(sk-proj-…、sk-ant-api03-…)本身就含连字符,
+/// 只认 `[A-Za-z0-9]` 会在第一个连字符处截断,前缀不足 20 位便整条漏检。
+/// 末尾强制一个字母数字,保证匹配不会停在连字符上(`\b` 在 `-` 前同样成立,
+/// 否则尾随标点会被吞进匹配结果)。最短正文仍为 20 位,不放宽门槛。
+static RE_SK_KEY: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\bsk-[A-Za-z0-9_-]{19,}[A-Za-z0-9]\b").unwrap());
 
 /// JWT。三段式且中段以 eyJ 开头(header/signature 的 base64url 前缀)
 static RE_JWT: LazyLock<Regex> = LazyLock::new(|| {
@@ -293,7 +299,7 @@ fn contains_china_id(text: &str) -> bool {
 /// 代码、配置文件、错误日志里出现 password 字样的频率远高于真实密码泄漏,
 /// 关键词匹配会制造大量误报,让人干脆关掉整个功能。这里只保留格式上
 /// 高度特异的凭证(有固定前缀、固定长度或可通过校验位验证)。
-fn contains_sensitive(text: &str) -> bool {
+pub(crate) fn contains_sensitive(text: &str) -> bool {
     if text.is_empty() {
         return false;
     }
@@ -643,6 +649,48 @@ mod tests {
         assert!(contains_sensitive(
             "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA\n-----END RSA PRIVATE KEY-----"
         ));
+    }
+
+    // 现代 sk- 密钥正文含 `-` / `_`(sk-proj-…、sk-ant-api03-…)。样本同样拼接构造
+    fn fx_sk_hyphen() -> String {
+        format!("{}GGR57ZnNnnBVQTul-jBeoc", "sk-u6")
+    }
+    fn fx_sk_long() -> String {
+        format!("{}bhoLSQ4ggDtzwXGylTv1QERH87RiOBYvJxFJreznS7QjLK", "sk-DZ")
+    }
+    fn fx_sk_proj() -> String {
+        format!("{}j-AbCdEf1234567890_ghijklmnop", "sk-pro")
+    }
+    fn fx_sk_ant() -> String {
+        format!("{}03-antApiKeyAbCdEf1234567890", "sk-ant-api")
+    }
+
+    #[test]
+    fn test_sensitive_sk_key_hyphenated_body() {
+        // 回归:正文里出现 `-` 时旧正则 `[A-Za-z0-9]{20,}` 会在连字符处截断,
+        // 18 位前缀不足 20 而整条漏检,密钥被正常入库
+        assert!(contains_sensitive(&fx_sk_hyphen()));
+        // 纯字母数字的 48 位密钥旧正则就能命中,不得因新写法回归
+        assert!(contains_sensitive(&fx_sk_long()));
+        // 现代格式:sk-proj-…(含 `-` 与 `_`)、sk-ant-api03-…
+        assert!(contains_sensitive(&fx_sk_proj()));
+        assert!(contains_sensitive(&fx_sk_ant()));
+        // 句子中间、带尾随标点时同样成立
+        assert!(contains_sensitive(&format!("我的 key 是 {} 别外传", fx_sk_hyphen())));
+        assert!(contains_sensitive(&format!("{}。", fx_sk_long())));
+    }
+
+    #[test]
+    fn test_sk_key_no_false_positive() {
+        // 长度栅栏:正文不足 20 位不算密钥,不能为了个例把门槛降到大量误报
+        assert!(!contains_sensitive("sk-short"));
+        assert!(!contains_sensitive("sk-"));
+        assert!(!contains_sensitive("sk-1234567890123456789"));
+        assert!(!contains_sensitive("task-sk-1234567890"));
+        assert!(!contains_sensitive("https://example.com/docs/disk-usage-guide"));
+        // 匹配结果必须以字母数字结尾:尾随连字符不被吞进匹配文本
+        let hit = RE_SK_KEY.find("sk-abcdefghijklmnopqrst-").unwrap();
+        assert!(hit.as_str().ends_with('t'));
     }
 
     #[test]

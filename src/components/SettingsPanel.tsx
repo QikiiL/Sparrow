@@ -7,6 +7,7 @@ import type { AppSettings } from '../types/settings';
 import { DEFAULT_SETTINGS } from '../types/settings';
 import { XIcon, ResetIcon } from './icons';
 import { PromptDialog } from './Dialogs';
+import { SyncSection } from './SyncSection';
 import { parseUpdateNotes, type UpdateInfo } from './UpdateDialog';
 import { openUrl } from '../lib/openUrl';
 import { UI_STYLES } from '../lib/uiStyle';
@@ -758,6 +759,9 @@ export function SettingsPanel({ isOpen, onClose }: Props) {
               )}
             </div>
           </Card>
+
+          {/* 云同步 */}
+          <SyncSection settings={settings} saveNow={saveNow} />
 
           {/* 数据 */}
           <SectionLabel>数据</SectionLabel>

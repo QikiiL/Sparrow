@@ -130,6 +130,12 @@ pub fn save_settings(app_handle: &tauri::AppHandle, settings: &AppSettings) -> R
         state.reload(app_handle);
     }
 
+    // 云同步配置改动立即生效:轮询循环读的是 SyncHandle 里的副本,
+    // 这里替换副本并唤醒循环(启用/停用/改地址都在下一轮生效)
+    if let Some(handle) = app_handle.try_state::<crate::services::sync::service::SyncHandle>() {
+        handle.set_settings(settings.sync.clone());
+    }
+
     // 短信验证码开关:轮询线程读的是原子标志,这里同步翻转,即改即生效
     crate::services::sms_code_service::set_enabled(settings.sms_code_enabled);
 

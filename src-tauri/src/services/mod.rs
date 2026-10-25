@@ -1,5 +1,6 @@
 pub mod clipboard_monitor;
 pub mod continuous_paste;
+pub mod credentials;
 pub mod exclusion_service;
 pub mod image_cleanup;
 pub mod identity;
@@ -7,4 +8,5 @@ pub mod paste_service;
 pub mod settings_service;
 pub mod sms_code_service;
 pub mod storage_service;
+pub mod sync;
 pub mod tray_service;

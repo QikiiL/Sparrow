@@ -42,7 +42,8 @@ pub async fn activate_item(
 pub async fn delete_item(app_handle: tauri::AppHandle, id: i64) -> Result<(), String> {
     let db = app_handle.state::<SqlitePool>();
 
-    // 先取出文件路径(图片 + html/rtf 格式文件),删行后清理对应文件
+    // 先取出文件路径(图片 + html/rtf 格式文件),删行后清理对应文件;
+    // content_hash 一并取出:删除成功后要写同步墓碑(否则 peer 会把这条"复活")
     let row = sqlx::query_as::<
         _,
         (
@@ -50,8 +51,9 @@ pub async fn delete_item(app_handle: tauri::AppHandle, id: i64) -> Result<(), St
             Option<String>,
             Option<String>,
             Option<String>,
+            Option<String>,
         ),
-    >("SELECT type, file_path, html_path, rtf_path FROM items WHERE id = ?")
+    >("SELECT type, file_path, html_path, rtf_path, content_hash FROM items WHERE id = ?")
     .bind(id)
     .fetch_optional(&*db)
     .await
@@ -63,7 +65,7 @@ pub async fn delete_item(app_handle: tauri::AppHandle, id: i64) -> Result<(), St
         .await
         .map_err(|e| e.to_string())?;
 
-    if let Some((item_type, file_path, html_path, rtf_path)) = row {
+    if let Some((item_type, file_path, html_path, rtf_path, content_hash)) = row {
         if item_type == Some(crate::models::clipboard_type::ClipboardType::Image as i32) {
             if let Some(path) = file_path {
                 crate::services::image_cleanup::remove_image_file(&app_handle, &path);
@@ -72,6 +74,10 @@ pub async fn delete_item(app_handle: tauri::AppHandle, id: i64) -> Result<(), St
         // html/rtf 格式文件在删除条目时一并清理(文本条目也可能携带)
         for path in [html_path, rtf_path].into_iter().flatten() {
             crate::services::image_cleanup::remove_format_file(&app_handle, &path);
+        }
+        // 行已删掉才写墓碑:删除失败(上面已 early return)不入队
+        if let Some(hash) = content_hash.filter(|h| !h.is_empty()) {
+            crate::services::sync::service::queue_tombstones(&app_handle, vec![hash]);
         }
     }
 
@@ -89,6 +95,23 @@ pub async fn clear_history(
     days: Option<i64>,
 ) -> Result<(), String> {
     let db = app_handle.state::<SqlitePool>();
+
+    // 删除前先收集 content_hash:清空是"显式删除",必须给 peer 留墓碑,
+    // 否则对端下次同步会把整批内容重新插回来(条件是下面 DELETE 的逐字副本)
+    let hashes: Vec<String> = match days.filter(|d| *d > 0) {
+        Some(days) => sqlx::query_scalar(
+            "SELECT content_hash FROM items WHERE is_favorite = 0 \
+             AND last_used_at < datetime('now', '-' || ? || ' days')",
+        )
+        .bind(days)
+        .fetch_all(&*db)
+        .await
+        .map_err(|e| e.to_string())?,
+        None => sqlx::query_scalar("SELECT content_hash FROM items WHERE is_favorite = 0")
+            .fetch_all(&*db)
+            .await
+            .map_err(|e| e.to_string())?,
+    };
 
     let result = match days.filter(|d| *d > 0) {
         Some(days) => {
@@ -110,6 +133,9 @@ pub async fn clear_history(
     if result.rows_affected() > 0 {
         // 收藏条目的图片保留,其余(含孤儿文件)清除
         crate::services::image_cleanup::remove_unreferenced_images(&app_handle, &*db).await;
+
+        // 批量入队墓碑(空列表由 queue_tombstones 静默跳过)
+        crate::services::sync::service::queue_tombstones(&app_handle, hashes);
 
         // 尽力回收数据库空间;若恰有并发连接占用导致失败,不影响清空结果
         if let Err(e) = sqlx::query("VACUUM").execute(&*db).await {

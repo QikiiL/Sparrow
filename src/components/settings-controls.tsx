@@ -173,3 +173,77 @@ export const ghostBtnDanger =
 /** 方形图标幽灵按钮(如重置热键) */
 export const ghostBtnIcon =
   'flex h-[27px] w-[27px] flex-shrink-0 items-center justify-center rounded-[8px] border border-hairline bg-transparent text-muted hover:bg-app hover:text-ink transition-colors duration-150 disabled:opacity-40 disabled:cursor-not-allowed';
+
+interface TextInputProps {
+  value: string;
+  onChange: (next: string) => void;
+  placeholder?: string;
+  type?: 'text' | 'password';
+  disabled?: boolean;
+  className?: string;
+  /** 失焦时提交(文本类设置按失焦落盘,避免每敲一个字符就写一次配置) */
+  onBlur?: () => void;
+}
+
+/** 单行文本输入(云同步等分区用) */
+export function TextInput({
+  value,
+  onChange,
+  placeholder,
+  type = 'text',
+  disabled,
+  className = '',
+  onBlur,
+}: TextInputProps) {
+  return (
+    <input
+      type={type}
+      value={value}
+      placeholder={placeholder}
+      disabled={disabled}
+      onChange={(e) => onChange(e.target.value)}
+      onBlur={onBlur}
+      className={`bg-app border border-hairline rounded-[9px] px-2.5 py-1.5 text-[12.5px] text-ink placeholder:text-faint outline-none transition-[border-color,box-shadow] duration-150 focus:outline-none focus:ring-1 focus:ring-accent/40 disabled:opacity-40 disabled:cursor-not-allowed ${className}`}
+    />
+  );
+}
+
+interface SegmentedProps<T extends string> {
+  value: T;
+  options: { value: T; label: string }[];
+  onChange: (next: T) => void;
+}
+
+/** 分段切换(与设置面板「关闭行为」同款样式) */
+export function Segmented<T extends string>({ value, options, onChange }: SegmentedProps<T>) {
+  return (
+    <div className="flex gap-[3px] p-0.5 rounded-[9px] bg-app border border-hairline">
+      {options.map((opt) => (
+        <button
+          key={opt.value}
+          type="button"
+          onClick={() => onChange(opt.value)}
+          aria-pressed={value === opt.value}
+          className={`flex-1 h-[26px] px-2 text-[11.5px] rounded-[7px] whitespace-nowrap transition-[background-color,color,box-shadow] duration-150 ${
+            value === opt.value
+              ? 'bg-surface text-accent font-semibold shadow-sm'
+              : 'text-muted hover:text-faint'
+          }`}
+        >
+          {opt.label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+/** 状态圆点(8px):ok / warn / danger / idle */
+export function StatusDot({ tone }: { tone: 'ok' | 'warn' | 'danger' | 'idle' }) {
+  const bg = {
+    ok: 'bg-ok',
+    warn: 'bg-warn',
+    danger: 'bg-danger',
+    idle: 'bg-faint',
+  }[tone];
+  return <span aria-hidden="true" className={`w-2 h-2 rounded-full flex-shrink-0 ${bg}`} />;
+}
