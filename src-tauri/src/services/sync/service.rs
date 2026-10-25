@@ -864,7 +864,7 @@ async fn land_format(
     let Some(blob_hash) = blob_hash.filter(|h| !h.is_empty()) else {
         return Ok(Landed::Absent);
     };
-    // blob hash 会拼进对象 key（`blobs/{hash}.bin`），peer 快照里的字段不可全信
+    // blob hash 会拼进对象 key（`blobs/{hash}.dat`），peer 快照里的字段不可全信
     if !is_blob_hash(blob_hash) {
         return Ok(Landed::Skipped("blob hash 非法"));
     }
@@ -1325,13 +1325,17 @@ fn device_conflict(device_id: &str) -> SyncError {
 // 小工具
 // ---------------------------------------------------------------------------
 
+/// blob 对象 key。
+///
+/// 扩展名必须是 `.dat`：Koofr 的 WebDAV 对 `.bin` 的 GET 返回 200 但 body 为空
+/// （HEAD 正常），所有附件都会下载失败；`.dat` 与无扩展名实测正常。
 fn blob_key(hash: &str) -> String {
-    format!("{BLOBS_DIR}/{hash}.bin")
+    format!("{BLOBS_DIR}/{hash}.dat")
 }
 
 /// blob hash 的形态校验：≥32 位纯 ASCII hex。
 ///
-/// 远端给的 hash 会拼进对象 key（`blobs/{hash}.bin`）与本地文件名
+/// 远端给的 hash 会拼进对象 key（`blobs/{hash}.dat`）与本地文件名
 /// （`{hash 前 16 位}.png`），所以必须是 hex：`../`、`/`、`:` 都不合法。
 fn is_blob_hash(hash: &str) -> bool {
     hash.len() >= 32 && hash.bytes().all(|b| b.is_ascii_hexdigit())
@@ -2566,7 +2570,7 @@ mod tests {
         let ra = run_cycle(&a).await.expect("A 周期");
         assert!(ra.uploaded);
         assert!(
-            backend.exists(&format!("blobs/{hash}.bin")),
+            backend.exists(&format!("blobs/{hash}.dat")),
             "图片 blob 应已加密上传"
         );
 
@@ -2605,7 +2609,7 @@ mod tests {
 
         let ra = run_cycle(&a).await.expect("A 周期");
         assert_eq!(ra.skipped_images, 0, "发送端不该丢图");
-        assert!(backend.exists(&format!("blobs/{hash}.bin")));
+        assert!(backend.exists(&format!("blobs/{hash}.dat")));
 
         // B 本地留一个 0 字节残骸：复用它就会永远坏着
         std::fs::create_dir_all(&b.images_dir).expect("建 B 的 images 目录");
@@ -2681,11 +2685,11 @@ mod tests {
         assert!(ra.uploaded);
         assert_eq!(ra.skipped_formats, 0, "发送端不该丢格式");
         assert!(
-            backend.exists(&format!("blobs/{}.bin", sha256_hex(&html))),
+            backend.exists(&format!("blobs/{}.dat", sha256_hex(&html))),
             "html blob 应以内容 hash 为键上传"
         );
         assert!(
-            backend.exists(&format!("blobs/{}.bin", sha256_hex(&rtf))),
+            backend.exists(&format!("blobs/{}.dat", sha256_hex(&rtf))),
             "rtf blob 应以内容 hash 为键上传"
         );
 
@@ -2751,8 +2755,8 @@ mod tests {
         let ra = run_cycle(&a).await.expect("A 周期");
         assert_eq!(ra.skipped_formats, 0);
 
-        let blob1 = format!("blobs/{}.bin", sha256_hex(&html1));
-        let blob2 = format!("blobs/{}.bin", sha256_hex(&html2));
+        let blob1 = format!("blobs/{}.dat", sha256_hex(&html1));
+        let blob2 = format!("blobs/{}.dat", sha256_hex(&html2));
         assert_ne!(blob1, blob2, "两份不同 html 必须是两个 blob key");
         assert_ne!(sha256_hex(&html1), hash1, "blob key 与 record.hash 无关");
         assert!(backend.exists(&blob1) && backend.exists(&blob2));
@@ -2854,7 +2858,7 @@ mod tests {
         run_cycle(&a).await.expect("A 周期");
         // 模拟 html blob 丢了（上传失败 / 远端被清理）
         backend
-            .delete(&format!("blobs/{}.bin", sha256_hex(&html)))
+            .delete(&format!("blobs/{}.dat", sha256_hex(&html)))
             .expect("删掉 html blob");
 
         let rb = run_cycle(&b).await.expect("B 周期");
@@ -2974,7 +2978,7 @@ mod tests {
         std::fs::write(&path_a, &bytes).expect("写图片");
         insert_image_row(&a.db, hash, &path_a.to_string_lossy()).await;
 
-        let key = format!("blobs/{hash}.bin");
+        let key = format!("blobs/{hash}.dat");
         backend.fail_put(&key);
 
         let ra = run_cycle(&a)
@@ -3026,7 +3030,7 @@ mod tests {
         insert_image_row(&a.db, hash, &path_a.to_string_lossy()).await;
 
         run_cycle(&a).await.expect("A 周期");
-        backend.fail_get(&format!("blobs/{hash}.bin"));
+        backend.fail_get(&format!("blobs/{hash}.dat"));
 
         let rb = run_cycle(&b).await.expect("坏 blob 不应让整轮失败");
         assert_eq!(rb.skipped_images, 1, "图片应计入 skipped");
@@ -3035,7 +3039,7 @@ mod tests {
         // blob GET 快速失败：只试 2 次（BLOB_GET_ATTEMPTS），不是 5 次。
         // 否则首次全量同步遇到几个坏对象就会在「同步中」停很久（每次 20s 超时）。
         assert_eq!(
-            backend.gets_for(&format!("blobs/{hash}.bin")),
+            backend.gets_for(&format!("blobs/{hash}.dat")),
             2,
             "单个坏 blob 只发起 2 次 GET"
         );
@@ -3409,6 +3413,16 @@ mod tests {
             "device",
             "空的 COMPUTERNAME 也不能变成空设备名"
         );
+    }
+
+    /// blob 对象必须用 `.dat` 扩展名：Koofr WebDAV 对 `.bin` 的 GET 返回空 body。
+    #[test]
+    fn blob_key_matches_dat_layout() {
+        let hash = "a".repeat(64);
+        let key = blob_key(&hash);
+        assert_eq!(key, format!("blobs/{hash}.dat"));
+        assert!(key.ends_with(".dat"), "key 必须以 .dat 结尾: {key}");
+        assert!(!key.contains(".bin"), "key 里不能出现 .bin: {key}");
     }
 
     #[test]

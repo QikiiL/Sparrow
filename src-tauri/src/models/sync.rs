@@ -133,7 +133,7 @@ pub struct SyncRecord {
     pub blob_size: Option<u64>,
     /// CF_HTML 原始字节的 sha256 hex。`None` = 该条目没有 HTML 副本
     /// （或本地文件缺失/超限，发送端已计入 `skipped_formats`）。
-    /// 内容寻址：远端对象是 `blobs/{html_blob}.bin`，与 record.hash 无关。
+    /// 内容寻址：远端对象是 `blobs/{html_blob}.dat`，与 record.hash 无关。
     #[serde(default)]
     pub html_blob: Option<String>,
     /// CF_HTML 明文字节数（接收端落盘后据此校验，展示用）。

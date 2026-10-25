@@ -946,7 +946,7 @@ async fn image_round_trip_over_real_http() {
     assert_eq!(ra.skipped_images, 0, "发送端不得丢图");
     assert!(
         server
-            .object(&dav_path(&format!("blobs/{hash}.bin")))
+            .object(&dav_path(&format!("blobs/{hash}.dat")))
             .is_some(),
         "图片 blob 应已加密上传"
     );
@@ -1016,7 +1016,7 @@ async fn rich_text_round_trip_over_real_http() {
     for body in [&html, &rtf] {
         assert!(
             server
-                .object(&dav_path(&format!("blobs/{}.bin", etag_hex(body))))
+                .object(&dav_path(&format!("blobs/{}.dat", etag_hex(body))))
                 .is_some(),
             "富文本 blob 应以内容 hash 为键上传"
         );

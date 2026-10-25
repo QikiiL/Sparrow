@@ -29,6 +29,12 @@ pub const TOMBSTONE_TTL_MS: i64 = 60 * 24 * 60 * 60 * 1000;
 /// 已上传 blob 记录上限（`uploaded_blobs` 是"这个 hash 已经传过"的缓存，
 /// 丢了只是多发一次 HEAD，所以可以放心截断）。
 pub const MAX_UPLOADED_BLOBS: usize = 2000;
+/// blob 对象 key 的布局版本。
+///
+/// 1 = `blobs/{hash}.bin`（旧版）；2 = `blobs/{hash}.dat`。
+/// Koofr 的 WebDAV 对 `.bin` 的 GET 返回 200 但 body 为空，所以 key 必须换扩展名。
+/// 版本升级时 `uploaded_blobs` / `last_upload_hash` 全部作废（旧记录指向的 key 已经没人读）。
+pub const BLOB_KEY_VERSION: u32 = 2;
 
 /// 一条删除墓碑：`hash` 在 `deleted_at`（epoch ms）被显式删除。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -75,6 +81,13 @@ pub struct SyncStateFile {
     pub meta_check: Option<String>,
     /// 上次同步完成时间（epoch ms），0 表示从未同步。
     pub last_sync_at: i64,
+    /// blob 对象 key 的布局版本，见 [`BLOB_KEY_VERSION`]。
+    ///
+    /// 旧文件没有这个键 → 反序列化为 0 → 触发一次上传缓存清空（重新上传全部附件）。
+    /// 字段级 `#[serde(default)]` 必须留着：容器级 default 会取 `Default` 里的
+    /// `BLOB_KEY_VERSION`，老文件就永远不会触发迁移。
+    #[serde(default)]
+    pub blob_key_version: u32,
 }
 
 impl Default for SyncStateFile {
@@ -88,6 +101,7 @@ impl Default for SyncStateFile {
             uploaded_blobs: Vec::new(),
             meta_check: None,
             last_sync_at: 0,
+            blob_key_version: BLOB_KEY_VERSION,
         }
     }
 }
@@ -134,6 +148,16 @@ pub fn load_or_init(config_dir: &Path) -> SyncStateFile {
     }
     if state.device_name.trim().is_empty() {
         state.device_name = default_device_name();
+    }
+    // blob key 布局升级：旧的 `.bin` 记录全部作废，否则 `uploaded_blobs` 会让老 blob
+    // 永远不重传（远端 `.bin` 对象 GET 回来是空 body）。只改内存，周期结束 `save()` 落盘；
+    // 没保存就再清一次，幂等。
+    if state.blob_key_version < BLOB_KEY_VERSION {
+        state.uploaded_blobs.clear();
+        // 快照里的 blob hash 没变 → 不清这个就会一直跳过上传
+        state.last_upload_hash = None;
+        state.blob_key_version = BLOB_KEY_VERSION;
+        eprintln!("sync: blob key 升级到 .dat，已清空上传缓存");
     }
     state
 }
@@ -530,6 +554,53 @@ mod tests {
             "缺省 device_name 要回落 COMPUTERNAME/device"
         );
         assert!(state.last_upload_hash.is_none());
+        cleanup(&dir);
+    }
+
+    // ---- blob key 布局迁移（`.bin` → `.dat`） ----
+
+    /// 老状态（没有 `blob_key_version`）必须清空上传缓存：否则 `uploaded_blobs`
+    /// 会让所有老 blob 永远不重传，远端 `.bin` 对象又读不回来。
+    #[test]
+    fn load_migrates_old_blob_key_version() {
+        let dir = temp_dir();
+        std::fs::write(
+            dir.join(STATE_FILE),
+            br#"{"device_id":"old","uploaded_blobs":["abc"],"last_upload_hash":"x"}"#,
+        )
+        .expect("写老版本状态");
+
+        let state = load_or_init(&dir);
+        assert!(state.uploaded_blobs.is_empty(), "老 blob 记录必须作废");
+        assert!(state.last_upload_hash.is_none(), "快照摘要必须作废");
+        assert_eq!(state.blob_key_version, BLOB_KEY_VERSION);
+        cleanup(&dir);
+    }
+
+    /// 迁移结果落盘后不再重复清空（幂等），新上传的记录要保留。
+    #[test]
+    fn blob_key_migration_persists_and_keeps_new_uploads() {
+        let dir = temp_dir();
+        std::fs::write(
+            dir.join(STATE_FILE),
+            br#"{"device_id":"old","uploaded_blobs":["abc"],"last_upload_hash":"x"}"#,
+        )
+        .expect("写老版本状态");
+
+        let mut state = load_or_init(&dir);
+        assert!(state.uploaded_blobs.is_empty());
+        state.uploaded_blobs.push("new-hash".to_string());
+        state.last_upload_hash = Some("y".to_string());
+        state.save(&dir).expect("保存迁移后的状态");
+
+        let reloaded = load_or_init(&dir);
+        assert_eq!(reloaded.blob_key_version, BLOB_KEY_VERSION);
+        assert_eq!(
+            reloaded.uploaded_blobs,
+            vec!["new-hash".to_string()],
+            "迁移只做一次，新记录不能被清掉"
+        );
+        assert_eq!(reloaded.last_upload_hash.as_deref(), Some("y"));
         cleanup(&dir);
     }
 

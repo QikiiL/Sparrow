@@ -35,7 +35,7 @@
 {webdav_url}/{root_prefix}/{key}
 ```
 
-`root_prefix` 默认 `sparrow`，`key` 是 `meta.json`、`devices/<uuid>.json`、`blobs/<hash>.bin`。
+`root_prefix` 默认 `sparrow`，`key` 是 `meta.json`、`devices/<uuid>.json`、`blobs/<hash>.dat`。
 **建议 URL 只写到父目录**，最后一级交给 `root_prefix`，否则会出现 `.../sparrow/sparrow/devices/...`。
 
 > **URL 里不要写用户名/密码。** `https://alice:secret@dav.example.com/x` 这种内嵌 userinfo 的写法会被后端直接拒绝（`WebDAV 地址不要包含用户名或密码，请分别填写用户名和密码`），设置面板也会在失焦时拦下并**不保存**。原因：`webdav_url` 是明文写进 `settings.json` 的，内嵌密码等于把密码落到磁盘上；用户名请填「用户名」，密码请填「密码」（进凭据管理器）。
@@ -152,7 +152,7 @@ AAD 的作用：把 A 对象的密文挪到 B 对象上会解密失败，避免�
 | `meta.json` 的 KDF 参数、salt 与 `check` 校验值 | 设备名（在密文快照里） |
 | 请求频率（即同步活跃度） | 图片内容、富文本内容、数量与内容之间的关联 |
 
-说明：图片与富文本副本都是**内容寻址**的，`blobs/{hash}.bin` 里的 hash 是明文字节（图片 / CF_HTML / RTF）的哈希。若攻击者已经猜到某份内容的确切字节，可以据此确认它是否在远端 —— 这是内容寻址的固有权衡。
+说明：图片与富文本副本都是**内容寻址**的，`blobs/{hash}.dat` 里的 hash 是明文字节（图片 / CF_HTML / RTF）的哈希。若攻击者已经猜到某份内容的确切字节，可以据此确认它是否在远端 —— 这是内容寻址的固有权衡。
 
 ### 5.4 日志脱敏
 
@@ -186,7 +186,7 @@ AAD 的作用：把 A 对象的密文挪到 B 对象上会解密失败，避免�
 ```
 {root_prefix}/meta.json                 # 明文：KDF 参数 + salt + check 校验值
 {root_prefix}/devices/{deviceId}.json   # 密文：本设备全量快照（含墓碑）
-{root_prefix}/blobs/{contentHash}.bin   # 密文：图片 / 富文本副本（HTML、RTF），内容寻址
+{root_prefix}/blobs/{contentHash}.dat   # 密文：图片 / 富文本副本（HTML、RTF），内容寻址
 {root_prefix}/.probe-{uuid}             # 测试连接的临时对象（用完即删）
 ```
 
@@ -238,7 +238,7 @@ AAD 的作用：把 A 对象的密文挪到 B 对象上会解密失败，避免�
 
 ### 6.4 图片
 
-- 先传 blob 再传快照：`HEAD blobs/{hash}.bin` → 不存在则加密后 `PUT`（`If-None-Match: *`，409/412 视为"已存在"，正常跳过）。
+- 先传 blob 再传快照：`HEAD blobs/{hash}.dat` → 不存在则加密后 `PUT`（`If-None-Match: *`，409/412 视为"已存在"，正常跳过）。
 - 接收方解密后写到 `data/images/{hash前16位}.png`（先写 `.tmp` 再 rename），再插库并带 `file_path`。
 - 超过 `max_blob_mb` 或本地文件缺失/读不到的图片，快照里直接跳过。
 - **单张图上传失败不阻断同步**：blob `PUT` 失败（2 次尝试后仍失败）只跳过该图，快照仍上传（文本/其它图片先同步过去），状态栏提示「N 个附件上传失败」，下一轮自动重试；连续多轮都失败再按 9 节排查带宽 / 代理 / `max_blob_mb`。
@@ -249,7 +249,7 @@ AAD 的作用：把 A 对象的密文挪到 B 对象上会解密失败，避免�
 文本/链接条目在本地可能带 `html_path` / `rtf_path`（CF_HTML 包装与 RTF 流的**原始字节**，落在 `data/formats/`）。同步时：
 
 - 快照里只带 `html_blob` / `html_size` / `rtf_blob` / `rtf_size`（blob = 原始字节的 sha256 hex，size = 字节数）；**绝不带本机绝对路径**。
-- 远端对象是 `blobs/{html_blob}.bin` / `blobs/{rtf_blob}.bin`，键是**内容** hash，与 `record.hash` 无关：同一份 html 被多个条目共享时只上传一次。
+- 远端对象是 `blobs/{html_blob}.dat` / `blobs/{rtf_blob}.dat`，键是**内容** hash，与 `record.hash` 无关：同一份 html 被多个条目共享时只上传一次。
 - 上传前读文件并自校验 `sha256(bytes) == blob_hash`，不一致就跳过（下一轮快照重算会得到新 blob hash，自然重试）；读取后无条件 `PUT`（换口令必须覆盖旧密文，理由同图片）。
 - 接收方解密 → 再校验 sha256 与 `*_size` → 写到 `data/formats/{record.hash 前 16 位}.html|.rtf`（先 `.tmp` 再 rename）。**不用 blob hash 命名**：两个条目共享同一份字节时，按 blob hash 命名会让它们指向同一个文件，删掉一个就把另一个的格式文件带走。
 - 任一种格式的 blob 缺失/解密失败/超限 → 该列置 `NULL`、计入 `skipped_formats`，**纯文本照常插入**（降级为纯文本，不丢条目）。
@@ -338,7 +338,7 @@ AAD 的作用：把 A 对象的密文挪到 B 对象上会解密失败，避免�
 ### 8.3 图片
 
 - [ ] A 截图或复制一张图片（PNG）。
-- [ ] A 点「立即同步」，等 `idle`；确认远端出现 `blobs/{hash}.bin`。
+- [ ] A 点「立即同步」，等 `idle`；确认远端出现 `blobs/{hash}.dat`。
 - [ ] B 在 ≤ 一个轮询间隔 + 2s 内出现一条 `[图片]` 条目，可预览、可粘贴回剪贴板。
 - [ ] B 的 `data/images/` 下出现对应 `.png` 文件。
 - [ ] （可选）把 `max_blob_mb` 改成 `0` 并重启，确认大图被跳过且不影响文本同步。
@@ -372,7 +372,7 @@ AAD 的作用：把 A 对象的密文挪到 B 对象上会解密失败，避免�
       grep -rn "hello cloud sync" .        # 应无输出
       grep -rniE "sk-[A-Za-z0-9_-]{19,}" . # 应无输出
       ```
-- [ ] 下载任一 `blobs/*.bin`，文件头应为 `SPRW1`，之后是二进制密文（不是 PNG 魔数 `\x89PNG`）。
+- [ ] 下载任一 `blobs/*.dat`，文件头应为 `SPRW1`，之后是二进制密文（不是 PNG 魔数 `\x89PNG`）。
 - [ ] 检查应用日志（若有落盘日志）：
       ```bash
       grep -niE "password|passphrase|secret|authorization|bearer" <日志文件>   # 应无输出
@@ -397,6 +397,7 @@ AAD 的作用：把 A 对象的密文挪到 B 对象上会解密失败，避免�
 | 连接超时 / 一直 `error` | 需要代理但未配置；DNS 或防火墙拦截 | 应用会读 Windows 系统代理设置，先在浏览器里确认能访问；`localhost` 目标不走代理 |
 | **`kind=Dns` /「域名解析失败（DNS）」**（校园网最常见） | **DNS 污染/间歇解析失败**：校园网、运营商对境外域名的解析被投毒或限流，浏览器能打开（走了代理/DoH）但应用直连解析不出来。同一域名时好时坏。实测某校园网：对 `app.koofr.net` 的 **UDP/53 查询被静默丢包**（校园 DNS 与 223.5.5.5 都超时），但 **TCP/53、DoH、443/TLS 全部正常**——说明是 DNS 层拦截，不是域名/IP 被封 | ① **hosts 钉 IP（最快）**：管理员编辑 `C:\Windows\System32\drivers\etc\hosts`，加 `167.235.4.177 app.koofr.net`（备用 `5.9.21.137` / `116.202.160.164`）；证书 `*.koofr.net` 仍然有效。② 开系统代理（Clash / V2Ray，打开「系统代理」或 TUN；应用只读 `ProxyEnable=1` 的 WinINET 设置）。③ Win11 网卡 DNS 设为 `223.5.5.5` / `1.1.1.1` **并启用「通过 HTTPS 的 DNS」**（只改 DNS 地址、仍走 UDP/53 时实测无效）。④ 换热点验证。⑤ 客户端会自动重试 5 次，但网络侧拦截无法根治。⑥ **DNS 解析超过 3 秒会以 `域名解析失败/超时` 失败并重试，不会无限卡在同步中；根治仍需 hosts/代理/DoH** |
 | 「`… 响应不完整 …`」/「`response body closed before all bytes were read`」（GET 中途断开） | 大文件（图片/富文本 blob）或代理在传输中途断开连接；MTU/分片被中间设备丢弃；服务器提前关闭 keep-alive | 客户端已加 `Connection: close` + 不复用连接 + 长度校验 + 重试 5 次；若持续出现：检查代理（关闭/换节点）、把 MTU 调到 1400 左右、换网络；单个 peer 快照读不通只会跳过该 peer（60s 冷却），不会阻断整轮 |
+| 远端 blob 是 `.bin` 时，GET 一律「`response body closed before all bytes were read`」，而 `meta.json` 正常 | **Koofr WebDAV 对 `.bin` 扩展名的 GET 返回 200 + `Content-Length` 正确，但 body 实际 0 字节**（HEAD 能返回正确大小与 ETag）——服务端的安全过滤，与文件名长度、文件大小、鉴权都无关 | 已改用 `.dat`（`BLOB_KEY_VERSION=2`）。**升级后首次同步会清空 `uploaded_blobs` 并重新上传全部附件（93 张图 / 约 28MB 属正常）**；远端旧的 `.bin` 对象可手动清理，不影响新同步 |
 | 状态栏「N 个设备快照未拉取」 | 远端 `devices/` 里有个读不通的对象（常见：第三台旧设备留下的快照、写了一半的对象） | 该 peer 已进入 60s 冷却，其它设备与本机同步不受影响；确认那台设备是否还在用，不再用就删掉远端 `{root_prefix}/devices/<id>.json` |
 | 状态栏「N 个附件上传失败」 | 某些图片/富文本 blob 上传失败（2 次尝试后仍 5xx / 超时 / 传输中断）：带宽不足、代理截断大对象、或单张图接近 `max_blob_mb` | **不会阻断文本同步**：失败的 blob 不记入 `uploaded_blobs`，下一轮自动重试，文本/其它条目照常同步。持续出现时按 6.3 排查网络与代理，或把 `max_blob_mb` 调小（超限的图会被直接跳过并计入 `skipped_images`）；日志里对应 `sync: upload blob <hash前8位> failed kind=…` |
 | 状态长时间停在「同步中 · 同步条目 i/n」/「上传附件 i/n」 | **首次全量同步大量图片**（几百张时要下载/上传几百个 blob）；或某台设备/某个 blob 读得很慢 | 进度点的序号会持续推进，属正常；单个 blob 最多 **20s × 2 次**失败后就跳过并计入告警（下载失败「N 张图片未同步」、上传失败「N 个附件上传失败」），**不会无限停在一个周期**。若长时间停在同一序号：检查带宽/代理，或把 `max_blob_mb` 调小；坏对象下一轮会再试 |
@@ -433,7 +434,7 @@ AAD 的作用：把 A 对象的密文挪到 B 对象上会解密失败，避免�
 |---|---|---|---|
 | 1 | A 复制普通文本，B 在轮询间隔内出现 | 8.1：A 复制（本机 `clipboard-changed` 立即唤醒上传）→ 掐表看 B 出现时间（≤ 间隔 + 1s）；即使不点「立即同步」最坏也只约一个间隔 | ☐ 通过 / ☐ 不通过 |
 | 2 | 敏感内容被拦截后不进同步队列 | 8.2：A 复制拼接构造的假 `sk-` 串 → A 无该记录、B 无该内容、远端 `devices/` 对象大小与 ETag 不变 | ☐ 通过 / ☐ 不通过 |
-| 3 | 远端只存密文、日志无明文 | 8.7：`devices/*.json` 为 base64 信封、`blobs/*.bin` 以 `SPRW1` 开头、`grep` 不到明文与凭证、`settings.json` 无口令 | ☐ 通过 / ☐ 不通过 |
+| 3 | 远端只存密文、日志无明文 | 8.7：`devices/*.json` 为 base64 信封、`blobs/*.dat` 以 `SPRW1` 开头、`grep` 不到明文与凭证、`settings.json` 无口令 | ☐ 通过 / ☐ 不通过 |
 | 4 | 多设备同时写不互相覆盖 | 8.6：两边同秒各复制一条 → 两边最终都有两条；每设备独立对象 + `If-Match` 保证不互相顶掉 | ☐ 通过 / ☐ 不通过 |
 | 5 | 断网恢复不重复、不回环 | 8.5：断网 2 分钟期间 A 复制 5 条 → 恢复后 B 补齐且各一条，A 也各一条（拉取不写剪贴板） | ☐ 通过 / ☐ 不通过 |
 | 6 | 不破坏本地功能 | 采集/粘贴/搜索/图片预览/retention 均正常；`cargo test --lib`、`vitest`、`tsc` 全绿 | ☐ 通过 / ☐ 不通过 |
