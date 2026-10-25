@@ -30,23 +30,34 @@ use crate::services::sync::backend::{build_backend, ObjectMeta, SyncBackend};
 use crate::services::sync::crypto::KeyCache;
 use crate::services::sync::merge::{self, MergeAction};
 use crate::services::sync::state::{self, PeerState, SyncStateFile, Tombstone};
-use crate::services::sync::{crypto, key_tag, snapshot, SyncError, SyncErrorKind};
+use crate::services::sync::{crypto, key_prefix, key_tag, snapshot, SyncError, SyncErrorKind};
 
 /// 远端目录（相对 root，后端的 key 不含 root）。
 const DEVICES_DIR: &str = "devices";
 const BLOBS_DIR: &str = "blobs";
 /// 图片条目的 content/preview 占位，与 `snapshot.rs` / 前端展示一致。
 const IMAGE_PREVIEW: &str = "[图片]";
-/// 一次操作最多尝试 3 次（首次 + 2 次重试）。
-const MAX_ATTEMPTS: u32 = 3;
+/// 一次操作最多尝试 5 次（首次 + 4 次重试）。
+///
+/// 为什么是 5：校园网/运营商 DNS 污染是**间歇**的——同一次同步里第一次解析
+/// 失败、几秒后重试就成功的情况很常见，多试几次能明显提高成功率。
+const MAX_ATTEMPTS: u32 = 5;
 
-/// 重试退避：500ms → 2s（计划第 6 节；3 次尝试只用到前两档）。
+/// 重试退避：500ms → 2s → 5s → 10s（5 次尝试共 4 次等待，累计约 17.5s）。
 #[cfg(not(test))]
-const RETRY_BACKOFF_MS: [u64; 2] = [500, 2000];
-/// 测试里把退避压到毫秒级，避免整个测试套件为退避多等 2.5s；
+const RETRY_BACKOFF_MS: [u64; 4] = [500, 2000, 5000, 10000];
+/// 测试里把退避压到毫秒级，避免整个测试套件为退避多等十几秒；
 /// 重试判定逻辑与生产路径完全一致，只是等待时间不同。
 #[cfg(test)]
-const RETRY_BACKOFF_MS: [u64; 2] = [1, 2];
+const RETRY_BACKOFF_MS: [u64; 4] = [1, 2, 3, 4];
+
+/// peer 快照 GET 的尝试次数：比常规操作少。
+///
+/// 远端有一个读不通的对象时，本轮不该为它等满 4 次退避（约 17s）——
+/// 失败后有 [`PEER_RETRY_COOLDOWN_MS`] 冷却，下一轮再试更划算。
+const PEER_GET_ATTEMPTS: u32 = 2;
+/// peer 快照拉取失败后的冷却期：60s 内不再尝试同一个 peer。
+const PEER_RETRY_COOLDOWN_MS: i64 = 60 * 1000;
 
 /// 一次同步周期的全部输入。
 ///
@@ -89,6 +100,11 @@ pub struct CycleReport {
     /// 本轮没能同步的富文本格式副本数（发送端文件缺失/超限 + 接收端 blob 缺失/
     /// 解密失败）。HTML 与 RTF 独立计数；纯文本本身照常同步，只是丢了格式。
     pub skipped_formats: u32,
+    /// 本轮没能拉到的 peer 快照数（网络/5xx/404，或仍在冷却期内）。
+    ///
+    /// 单个 peer 读不通**不**中断整轮：远端多出一个读不通的对象（常见于第三台
+    /// 旧设备留下的快照）不该让本机的文本/图片同步一起停摆。
+    pub skipped_peers: u32,
 }
 
 /// 接收端一条图片的落地结果。
@@ -114,14 +130,26 @@ enum InsertOutcome {
 
 /// 跳过时给用户看的告警文案（0 个 → 无告警）。
 ///
-/// 图片与富文本分开说：用户需要知道丢的是"图片"还是"富文本格式"，
-/// 两者处理方式不同（图片是整条没同步，富文本只是退化成纯文本）。
-fn sync_warning(skipped_images: u32, skipped_formats: u32) -> Option<String> {
+/// 图片、富文本、peer 快照分开说：用户需要知道丢的是"图片"还是"富文本格式"，
+/// 两者处理方式不同（图片是整条没同步，富文本只是退化成纯文本）；而
+/// "设备快照未拉取"意味着**某个设备**的条目这轮没进来，跟本机内容无关。
+fn sync_warning(skipped_images: u32, skipped_formats: u32, skipped_peers: u32) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
     match (skipped_images, skipped_formats) {
-        (0, 0) => None,
-        (images, 0) => Some(format!("{images} 张图片未同步")),
-        (0, formats) => Some(format!("{formats} 个富文本未同步")),
-        (images, formats) => Some(format!("{images} 张图片、{formats} 个富文本未同步")),
+        (0, 0) => {}
+        (images, 0) => parts.push(format!("{images} 张图片未同步")),
+        (0, formats) => parts.push(format!("{formats} 个富文本未同步")),
+        (images, formats) => {
+            parts.push(format!("{images} 张图片、{formats} 个富文本未同步"));
+        }
+    }
+    if skipped_peers > 0 {
+        parts.push(format!("{skipped_peers} 个设备快照未拉取"));
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("；"))
     }
 }
 
@@ -152,7 +180,11 @@ pub async fn run_cycle(ctx: &CycleCtx) -> Result<CycleReport, SyncError> {
             last_sync_at: st.last_sync_at,
             last_error: None,
             pending: report.pending,
-            warning: sync_warning(report.skipped_images, report.skipped_formats),
+            warning: sync_warning(
+                report.skipped_images,
+                report.skipped_formats,
+                report.skipped_peers,
+            ),
             skipped: report.skipped_images + report.skipped_formats,
         }),
         Err(e) => {
@@ -181,7 +213,8 @@ async fn cycle_body(ctx: &CycleCtx, st: &mut SyncStateFile) -> Result<CycleRepor
     }
 
     // 1. 扫远端 peers（LIST + 按 ETag 增量 GET）
-    let snapshots = fetch_peer_snapshots(ctx, st).await?;
+    //    单个 peer 读不通只跳过（并记冷却期），不中断整轮
+    let (snapshots, skipped_peers) = fetch_peer_snapshots(ctx, st).await?;
 
     // 2. 远端墓碑先并入本地状态。`merge::plan_merge` 只看 `tombstones` 参数、
     //    不看 `SyncRecord::deleted_at`，所以必须先并进来：否则远端墓碑记录
@@ -278,6 +311,7 @@ async fn cycle_body(ctx: &CycleCtx, st: &mut SyncStateFile) -> Result<CycleRepor
         pending: 0,
         skipped_images,
         skipped_formats,
+        skipped_peers,
     })
 }
 
@@ -296,27 +330,48 @@ async fn io<T: Send + 'static>(
 
 /// 仅 `Network` / `Server` 重试，最多 [`MAX_ATTEMPTS`] 次；其它错误立即返回。
 ///
-/// 日志只在最终失败时打一行（操作名 + key_tag + kind），不打印 URL/响应体。
+/// DNS 污染（`kind=Dns`）映射成 `Network`，所以域名解析的间歇失败同样走这条
+/// 退避重试：1 次失败不代表配置有问题。
+///
+/// 日志只在最终失败时打一行（操作名 + key_tag + key 形状 + kind），
+/// 不打印 URL/响应体。
 fn retry<T>(
     op: &str,
     key: &str,
     mut f: impl FnMut() -> Result<T, SyncError>,
 ) -> Result<T, SyncError> {
+    retry_with_attempts(op, key, MAX_ATTEMPTS, &mut f)
+}
+
+/// 同 [`retry`]，但允许调用方指定尝试次数。
+///
+/// peer 快照用更少的次数：远端有一个读不通的对象时，本轮不该为它等满
+/// 4 次退避（约 17s）——失败后还有 [`PEER_RETRY_COOLDOWN_MS`] 的冷却，
+/// 下一轮再试更划算。
+fn retry_with_attempts<T>(
+    op: &str,
+    key: &str,
+    max_attempts: u32,
+    mut f: impl FnMut() -> Result<T, SyncError>,
+) -> Result<T, SyncError> {
+    let max_attempts = max_attempts.max(1);
     let mut attempt: u32 = 1;
     loop {
         match f() {
             Ok(value) => return Ok(value),
             Err(e) => {
-                if !e.kind.retryable() || attempt >= MAX_ATTEMPTS {
+                if !e.kind.retryable() || attempt >= max_attempts {
                     eprintln!(
-                        "sync: {op} 失败: key={} kind={} attempts={attempt}",
+                        "sync: {op} 失败: key={} shape={} kind={} attempts={attempt}",
                         key_tag(key),
+                        key_prefix(key),
                         e.kind.as_str()
                     );
                     return Err(e);
                 }
-                let delay = RETRY_BACKOFF_MS[(attempt - 1) as usize];
-                std::thread::sleep(std::time::Duration::from_millis(delay));
+                // 退避表按生产档位设计；尝试次数被调小时只用到前面几档
+                let idx = ((attempt - 1) as usize).min(RETRY_BACKOFF_MS.len() - 1);
+                std::thread::sleep(std::time::Duration::from_millis(RETRY_BACKOFF_MS[idx]));
                 attempt += 1;
             }
         }
@@ -330,9 +385,18 @@ async fn remote_list(ctx: &CycleCtx, prefix: &str) -> Result<Vec<ObjectMeta>, Sy
 }
 
 async fn remote_get(ctx: &CycleCtx, key: &str) -> Result<Option<Vec<u8>>, SyncError> {
+    remote_get_with_attempts(ctx, key, MAX_ATTEMPTS).await
+}
+
+/// 同 [`remote_get`]，可指定尝试次数（peer 快照用 [`PEER_GET_ATTEMPTS`]）。
+async fn remote_get_with_attempts(
+    ctx: &CycleCtx,
+    key: &str,
+    attempts: u32,
+) -> Result<Option<Vec<u8>>, SyncError> {
     let backend = Arc::clone(&ctx.backend);
     let key = key.to_string();
-    io(move || retry("GET", &key, || backend.get(&key))).await
+    io(move || retry_with_attempts("GET", &key, attempts, || backend.get(&key))).await
 }
 
 async fn remote_head(ctx: &CycleCtx, key: &str) -> Result<Option<ObjectMeta>, SyncError> {
@@ -361,12 +425,23 @@ async fn remote_put(
 // 1. 拉取 peer 快照
 // ---------------------------------------------------------------------------
 
+/// 拉取所有 peer 快照。
+///
+/// 返回 `(快照列表, 跳过的 peer 数)`。**单个 peer 读不通不中断整轮**：
+/// 远端多出一个读不通的对象（典型来源是第三台旧设备留下的快照、或写了一半的
+/// 对象）不该让本机的文本/图片同步一起停摆。失败后给该 peer 记一个冷却期
+/// （[`PEER_RETRY_COOLDOWN_MS`]），避免每轮都为它等满重试。
+///
+/// 例外是**认证失败**（GET 401/403，或解不开 peer 密文）：口令/权限问题必须
+/// 整轮显式失败，跳过 + 报"同步正常"只会掩盖问题。
 async fn fetch_peer_snapshots(
     ctx: &CycleCtx,
     st: &mut SyncStateFile,
-) -> Result<Vec<Snapshot>, SyncError> {
+) -> Result<(Vec<Snapshot>, u32), SyncError> {
     let metas = remote_list(ctx, DEVICES_DIR).await?;
     let mut out: Vec<Snapshot> = Vec::with_capacity(metas.len());
+    let mut skipped_peers: u32 = 0;
+    let now = state::now_ms();
 
     for meta in metas {
         let Some(device) = device_id_from_key(&meta.key) else {
@@ -382,8 +457,43 @@ async fn fetch_peer_snapshots(
                 continue;
             }
         }
+        // 冷却期内不再尝试：上一个周期已经确认这个对象读不通
+        if let Some(until) = st.peers.get(device).and_then(|p| p.retry_after_ms) {
+            if until > now {
+                skipped_peers += 1;
+                continue;
+            }
+        }
 
-        let Some(bytes) = remote_get(ctx, &meta.key).await? else {
+        let fetched = match remote_get_with_attempts(ctx, &meta.key, PEER_GET_ATTEMPTS).await {
+            Ok(bytes) => bytes,
+            // 认证失败不是"这个 peer 坏了"：口令/权限问题必须整轮显式失败，
+            // 否则错口令期间每轮都只跳过一个 peer、还照样报"同步正常"。
+            Err(e) if e.kind == SyncErrorKind::Auth => {
+                eprintln!(
+                    "sync: peer GET 认证失败 kind={} shape={}（整轮中止）",
+                    e.kind.as_str(),
+                    key_prefix(&meta.key)
+                );
+                return Err(e);
+            }
+            // 其余（网络/5xx/404/配置）：跳过这个 peer、记冷却期，本轮继续。
+            // 远端一个读不通的对象不该让本机的文本/图片同步一起停摆。
+            Err(e) => {
+                eprintln!(
+                    "sync: skip peer {} kind={} shape={}（{}s 内不再重试）",
+                    short_id(device),
+                    e.kind.as_str(),
+                    key_prefix(&meta.key),
+                    PEER_RETRY_COOLDOWN_MS / 1000
+                );
+                let entry = st.peers.entry(device.to_string()).or_default();
+                entry.retry_after_ms = Some(now + PEER_RETRY_COOLDOWN_MS);
+                skipped_peers += 1;
+                continue;
+            }
+        };
+        let Some(bytes) = fetched else {
             continue;
         };
         // AAD = 对象 key（与上传时一致）
@@ -394,6 +504,8 @@ async fn fetch_peer_snapshots(
                     PeerState {
                         etag: meta.etag.clone(),
                         updated_at: snap.generated_at,
+                        // 成功即清空冷却
+                        retry_after_ms: None,
                     },
                 );
                 out.push(snap);
@@ -406,15 +518,18 @@ async fn fetch_peer_snapshots(
                 return Err(SyncError::auth(crypto::AUTH_MISMATCH));
             }
             // 其它错误（信封损坏等）仍只跳过：不能因为一个坏文件中断整轮
-            Err(e) => eprintln!(
-                "sync: skip peer {} kind={}",
-                short_id(device),
-                e.kind.as_str()
-            ),
+            Err(e) => {
+                eprintln!(
+                    "sync: skip peer {} kind={}",
+                    short_id(device),
+                    e.kind.as_str()
+                );
+                skipped_peers += 1;
+            }
         }
     }
 
-    Ok(out)
+    Ok((out, skipped_peers))
 }
 
 /// `devices/{id}.json` → `{id}`；不是这个形状的 key 一律忽略。
@@ -592,8 +707,19 @@ async fn insert_image(ctx: &CycleCtx, rec: &SyncRecord) -> Result<ImageOutcome, 
             let _ = std::fs::remove_file(&path);
         }
         let key = blob_key(&rec.hash);
-        let Some(sealed) = remote_get(ctx, &key).await? else {
-            return Ok(ImageOutcome::Skipped("blob 缺失"));
+        // 单张图片的 blob 下载失败不能拖垮整轮：跳过它并计入告警，文本/其它图片照常同步。
+        let sealed = match remote_get(ctx, &key).await {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => return Ok(ImageOutcome::Skipped("blob 缺失")),
+            Err(e) if e.kind == SyncErrorKind::Auth => return Err(e),
+            Err(e) => {
+                eprintln!(
+                    "sync: skip image blob {} kind={}",
+                    short_id(&rec.hash),
+                    e.kind.as_str()
+                );
+                return Ok(ImageOutcome::Skipped("下载失败"));
+            }
         };
         let plain = match crypto::open_blob(&ctx.key, &key, &sealed) {
             Ok(plain) => plain,
@@ -699,8 +825,19 @@ async fn land_format(
     }
 
     let key = blob_key(blob_hash);
-    let Some(sealed) = remote_get(ctx, &key).await? else {
-        return Ok(Landed::Skipped("blob 缺失"));
+    // 单个格式 blob 下载失败只降级该格式（纯文本仍入库），不能中断整轮。
+    let sealed = match remote_get(ctx, &key).await {
+        Ok(Some(bytes)) => bytes,
+        Ok(None) => return Ok(Landed::Skipped("blob 缺失")),
+        Err(e) if e.kind == SyncErrorKind::Auth => return Err(e),
+        Err(e) => {
+            eprintln!(
+                "sync: skip format blob {} kind={}",
+                short_id(blob_hash),
+                e.kind.as_str()
+            );
+            return Ok(Landed::Skipped("下载失败"));
+        }
     };
     let plain = match crypto::open_blob(&ctx.key, &key, &sealed) {
         Ok(plain) => plain,
@@ -1035,6 +1172,7 @@ async fn upload_snapshot(
         PeerState {
             etag,
             updated_at: snap.generated_at,
+            retry_after_ms: None,
         },
     );
     Ok(true)
@@ -1732,7 +1870,11 @@ async fn run_loop(inner: Arc<Inner>) {
                     last_sync_at,
                     last_error: None,
                     pending: 0,
-                    warning: sync_warning(report.skipped_images, report.skipped_formats),
+                    warning: sync_warning(
+                        report.skipped_images,
+                        report.skipped_formats,
+                        report.skipped_peers,
+                    ),
                     skipped: report.skipped_images + report.skipped_formats,
                 });
             }
@@ -1771,6 +1913,10 @@ mod tests {
         /// 剩余多少次 `list` 要返回 5xx（模拟网络抖动）
         list_failures: AtomicUsize,
         seq: AtomicUsize,
+        /// 这些 key 的 GET 永远返回 5xx（模拟远端读不通的坏对象）
+        get_failures: Mutex<HashSet<String>>,
+        /// 每个 key 各被 GET 了多少次（断言冷却期"没再请求"）
+        gets_by_key: Mutex<HashMap<String, usize>>,
     }
 
     impl MockBackend {
@@ -1784,6 +1930,21 @@ mod tests {
 
         fn fail_next_lists(&self, n: usize) {
             self.list_failures.store(n, Ordering::SeqCst);
+        }
+
+        /// 让某个 key 的 GET 一直返回 5xx。
+        fn fail_get(&self, key: &str) {
+            self.get_failures.lock().unwrap().insert(key.to_string());
+        }
+
+        /// 某个 key 的 GET 次数。
+        fn gets_for(&self, key: &str) -> usize {
+            self.gets_by_key
+                .lock()
+                .unwrap()
+                .get(key)
+                .copied()
+                .unwrap_or(0)
         }
 
         fn exists(&self, key: &str) -> bool {
@@ -1835,6 +1996,15 @@ mod tests {
 
         fn get(&self, key: &str) -> Result<Option<Vec<u8>>, SyncError> {
             self.gets.fetch_add(1, Ordering::SeqCst);
+            *self
+                .gets_by_key
+                .lock()
+                .unwrap()
+                .entry(key.to_string())
+                .or_insert(0) += 1;
+            if self.get_failures.lock().unwrap().contains(key) {
+                return Err(SyncError::server("GET 失败: status=500"));
+            }
             Ok(self
                 .objects
                 .lock()
@@ -2524,13 +2694,45 @@ mod tests {
     /// 告警文案：图片与富文本分开说，两者都为 0 时没有告警。
     #[test]
     fn warning_mentions_images_and_formats() {
-        assert_eq!(sync_warning(0, 0), None);
-        assert_eq!(sync_warning(3, 0).as_deref(), Some("3 张图片未同步"));
-        assert_eq!(sync_warning(0, 2).as_deref(), Some("2 个富文本未同步"));
+        assert_eq!(sync_warning(0, 0, 0), None);
+        assert_eq!(sync_warning(3, 0, 0).as_deref(), Some("3 张图片未同步"));
+        assert_eq!(sync_warning(0, 2, 0).as_deref(), Some("2 个富文本未同步"));
         assert_eq!(
-            sync_warning(3, 2).as_deref(),
+            sync_warning(3, 2, 0).as_deref(),
             Some("3 张图片、2 个富文本未同步")
         );
+        // peer 快照没拉到时也要说清楚是"某个设备"，而不是本机内容丢了
+        assert_eq!(sync_warning(0, 0, 1).as_deref(), Some("1 个设备快照未拉取"));
+        assert_eq!(
+            sync_warning(1, 1, 2).as_deref(),
+            Some("1 张图片、1 个富文本未同步；2 个设备快照未拉取")
+        );
+    }
+
+    /// 单个图片 blob 下载失败不能拖垮整轮：文本仍要落库，图片计入 skipped。
+    #[tokio::test]
+    async fn image_blob_get_failure_does_not_block_text() {
+        let backend = Arc::new(MockBackend::default());
+        let dir_a = temp_dir();
+        let dir_b = temp_dir();
+        let a = make_ctx(Arc::clone(&backend), &dir_a).await;
+        let b = make_ctx(Arc::clone(&backend), &dir_b).await;
+
+        insert_text(&a.db, "仍然要同步的文本", "text1").await;
+        let hash = "aabbccddeeff00112233445566778899";
+        let bytes: Vec<u8> = (0u8..16).collect();
+        std::fs::create_dir_all(&a.images_dir).expect("建 images 目录");
+        let path_a = a.images_dir.join(format!("{}.png", &hash[..16]));
+        std::fs::write(&path_a, &bytes).expect("写图片");
+        insert_image_row(&a.db, hash, &path_a.to_string_lossy()).await;
+
+        run_cycle(&a).await.expect("A 周期");
+        backend.fail_get(&format!("blobs/{hash}.bin"));
+
+        let rb = run_cycle(&b).await.expect("坏 blob 不应让整轮失败");
+        assert_eq!(rb.skipped_images, 1, "图片应计入 skipped");
+        assert_eq!(count_hash(&b.db, "text1").await, 1, "文本仍应插入");
+        assert_eq!(count_hash(&b.db, hash).await, 0, "坏图片不应插入");
     }
 
     /// 错口令（错 key）必须整轮显式失败，而且**不许写远端**：
@@ -2625,14 +2827,128 @@ mod tests {
     #[tokio::test]
     async fn list_retries_through_server_errors() {
         let backend = Arc::new(MockBackend::default());
-        backend.fail_next_lists(2);
+        // 前 4 次失败、第 5 次成功：刚好用满 MAX_ATTEMPTS
+        backend.fail_next_lists(4);
         let dir = temp_dir();
         let ctx = make_ctx(Arc::clone(&backend), &dir).await;
         insert_text(&ctx.db, "重试后仍要成功", "h1").await;
 
-        let report = run_cycle(&ctx).await.expect("两次 5xx 后应成功");
+        let report = run_cycle(&ctx).await.expect("四次 5xx 后应成功");
         assert!(report.uploaded);
-        assert_eq!(backend.list_calls(), 3, "应恰好尝试 3 次");
+        assert_eq!(
+            backend.list_calls(),
+            MAX_ATTEMPTS as usize,
+            "应恰好尝试 MAX_ATTEMPTS 次"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_gives_up_after_max_attempts() {
+        let backend = Arc::new(MockBackend::default());
+        // 一直失败：重试必须在 MAX_ATTEMPTS 次后停下，不能无限重试
+        backend.fail_next_lists(MAX_ATTEMPTS as usize + 5);
+        let dir = temp_dir();
+        let ctx = make_ctx(Arc::clone(&backend), &dir).await;
+        insert_text(&ctx.db, "永远失败", "h1").await;
+
+        let err = run_cycle(&ctx).await.expect_err("一直 5xx 必须失败");
+        assert_eq!(err.kind, SyncErrorKind::Server);
+        assert_eq!(
+            backend.list_calls(),
+            MAX_ATTEMPTS as usize,
+            "重试次数必须收敛到 MAX_ATTEMPTS"
+        );
+    }
+
+    /// DNS 失败（Network）也要走满重试：校园网污染是间歇的，多试几次能成功
+    #[test]
+    fn dns_errors_are_retried() {
+        let calls = AtomicUsize::new(0);
+        let value = retry::<u8>("GET", "blobs/x.bin", || {
+            let n = calls.fetch_add(1, Ordering::SeqCst) + 1;
+            if n < MAX_ATTEMPTS as usize {
+                Err(SyncError::network(
+                    crate::services::sync::dns_error_message("GET", "blobs/x.bin"),
+                ))
+            } else {
+                Ok(7)
+            }
+        })
+        .expect("DNS 间歇失败后应成功");
+        assert_eq!(value, 7);
+        assert_eq!(calls.load(Ordering::SeqCst), MAX_ATTEMPTS as usize);
+    }
+
+    /// 远端有一个读不通的 peer 快照（典型：第三台旧设备留下的坏对象）时，
+    /// 整轮同步不能被它拖死：好 peer 的条目照常合并，坏 peer 计入 skipped_peers。
+    #[tokio::test]
+    async fn bad_peer_snapshot_does_not_block_cycle() {
+        let backend = Arc::new(MockBackend::default());
+        let dir_a = temp_dir();
+        let dir_c = temp_dir();
+        let a = make_ctx(Arc::clone(&backend), &dir_a).await;
+        let c = make_ctx(Arc::clone(&backend), &dir_c).await;
+        insert_text(&a.db, "来自 A 的内容", "hA").await;
+        insert_text(&c.db, "来自 C 的内容", "hC").await;
+        run_cycle(&a).await.expect("A 上传快照");
+        run_cycle(&c).await.expect("C 上传快照");
+
+        // C 的快照读不通
+        let c_key = format!(
+            "{}/{}.json",
+            DEVICES_DIR,
+            state::load_or_init(&dir_c).device_id
+        );
+        backend.fail_get(&c_key);
+
+        let dir_b = temp_dir();
+        let b = make_ctx(Arc::clone(&backend), &dir_b).await;
+        let report = run_cycle(&b).await.expect("一个坏 peer 不该阻断整轮");
+
+        assert_eq!(report.skipped_peers, 1, "应报告 1 个 peer 未拉取");
+        assert_eq!(report.peer_count, 1, "只读到 A 的快照");
+        assert_eq!(
+            count_hash(&b.db, "hA").await,
+            1,
+            "好 peer 的条目必须照常同步进来"
+        );
+        assert_eq!(count_hash(&b.db, "hC").await, 0, "坏 peer 的条目这轮进不来");
+    }
+
+    /// 坏 peer 失败后进入冷却期：60s 内不再 GET 它，
+    /// 否则每个 5s 周期都要为同一个坏对象等满重试。
+    #[tokio::test]
+    async fn bad_peer_is_not_retried_within_cooldown() {
+        let backend = Arc::new(MockBackend::default());
+        let dir_c = temp_dir();
+        let c = make_ctx(Arc::clone(&backend), &dir_c).await;
+        insert_text(&c.db, "来自 C 的内容", "hC").await;
+        run_cycle(&c).await.expect("C 上传快照");
+
+        let c_key = format!(
+            "{}/{}.json",
+            DEVICES_DIR,
+            state::load_or_init(&dir_c).device_id
+        );
+        backend.fail_get(&c_key);
+
+        let dir_b = temp_dir();
+        let b = make_ctx(Arc::clone(&backend), &dir_b).await;
+        let first = run_cycle(&b).await.expect("第一轮应 Ok");
+        assert_eq!(first.skipped_peers, 1);
+        let attempts = backend.gets_for(&c_key);
+        assert_eq!(
+            attempts, PEER_GET_ATTEMPTS as usize,
+            "坏 peer 只试 PEER_GET_ATTEMPTS 次（不为它等满 4 档退避）"
+        );
+
+        let second = run_cycle(&b).await.expect("第二轮同样应 Ok");
+        assert_eq!(second.skipped_peers, 1, "冷却期内仍如实报告未拉取");
+        assert_eq!(
+            backend.gets_for(&c_key),
+            attempts,
+            "冷却期内不该再 GET 同一个坏 peer"
+        );
     }
 
     #[tokio::test]

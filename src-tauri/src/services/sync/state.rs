@@ -45,6 +45,12 @@ pub struct PeerState {
     pub etag: Option<String>,
     /// 该快照的 generated_at（epoch ms），仅用于展示/排查。
     pub updated_at: i64,
+    /// 拉取失败后的冷却截止时间（epoch ms）：在此之前不再 GET 这个 peer。
+    ///
+    /// 远端出现一个读不通的快照（第三台旧设备、被写坏/半截的对象）时，
+    /// 若每个 5s 周期都为它跑满重试（5 次、累计约 17s），同步会被一个
+    /// 无关对象长期拖慢。冷却期过后再试一次，成功了就清空。
+    pub retry_after_ms: Option<i64>,
 }
 
 /// `config/sync-state.json` 的内容。
@@ -388,6 +394,7 @@ mod tests {
             PeerState {
                 etag: Some("\"e1\"".to_string()),
                 updated_at: 42,
+                retry_after_ms: Some(1_700_000_060_000),
             },
         );
         state.add_tombstone("h1", 1000);

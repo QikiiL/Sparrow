@@ -54,19 +54,36 @@ pub(crate) fn probe_key() -> String {
     format!(".probe-{}", uuid::Uuid::new_v4())
 }
 
-/// 连接探测：写一个临时对象 → 读回校验 → 删除（尽力而为），返回耗时文案。
+/// 探测载荷大小：256 KB。
+///
+/// 只写 2 字节的探测在"控制面通、数据面被代理/MTU 截断"的网络里会误报成功
+/// （真实故障就是测试连接通过、同步 GET 大 blob 时 `response body closed`）。
+/// 256 KB 足以覆盖本机图片/富文本 blob 的常见大小，又不会太慢。
+pub(crate) const PROBE_BYTES: usize = 256 * 1024;
+
+/// 确定性伪随机载荷：同样的输入每次一致，便于测试与避免全零被压缩/特殊处理。
+pub(crate) fn probe_body() -> Vec<u8> {
+    (0..PROBE_BYTES)
+        .map(|i| ((i.wrapping_mul(31) + 17) % 251) as u8)
+        .collect()
+}
+
+/// 连接探测：写一个临时对象 → 读回逐字节校验 → 删除（尽力而为），返回耗时文案。
 ///
 /// 抽成独立函数是为了可测：单测用 mock 后端断言 key 与真实请求路径，
 /// 不必拉起 Tauri AppHandle。
 pub(crate) fn run_probe(backend: &dyn SyncBackend, key: &str) -> Result<String, SyncError> {
     let started = std::time::Instant::now();
+    let body = probe_body();
     // If-None-Match: * —— 探测对象本不该存在，冲突即说明 key 撞了
-    backend.put(key, b"ok", Some("*"))?;
+    backend.put(key, &body, Some("*"))?;
     let read_back = backend.get(key)?;
     // 删除是尽力而为：探测对象残留不影响结论，也不该把成功报成失败
     let _ = backend.delete(key);
-    if read_back.as_deref() != Some(b"ok".as_slice()) {
-        return Err(SyncError::config("探测对象读回内容不一致"));
+    if read_back.as_deref() != Some(body.as_slice()) {
+        return Err(SyncError::config(
+            "探测对象读回内容不一致（可能被代理或网络截断）",
+        ));
     }
     Ok(format!("连接成功 · {} ms", started.elapsed().as_millis()))
 }
@@ -133,6 +150,17 @@ mod tests {
     }
 
     #[test]
+    fn probe_body_covers_data_plane_size() {
+        let body = probe_body();
+        assert_eq!(body.len(), PROBE_BYTES);
+        assert!(PROBE_BYTES >= 128 * 1024, "探测载荷要足够暴露截断");
+        // 确定性：两次构造必须一致，否则读回比较永远失败
+        assert_eq!(body, probe_body());
+        // 不能是全零（某些代理会对全零载荷做特殊处理）
+        assert!(body.iter().any(|b| *b != 0));
+    }
+
+    #[test]
     fn run_probe_uses_single_root_path() {
         let server = MockServer::start();
         // 路径精确匹配 {base}/{root}/.probe-*：双 root 的路径不会命中这条 mock
@@ -144,7 +172,7 @@ mod tests {
         let get = server.mock(|when, then| {
             when.method(GET)
                 .path_matches(Regex::new(r"^/sparrow/\.probe-[0-9a-f-]+$").unwrap());
-            then.status(200).body("ok");
+            then.status(200).body(probe_body());
         });
         let delete = server.mock(|when, then| {
             when.method(DELETE)

@@ -156,7 +156,7 @@ AAD 的作用：把 A 对象的密文挪到 B 对象上会解密失败，避免�
 
 ### 5.4 日志脱敏
 
-- 日志里只允许出现：操作名、后端类型、对象 key 的 SHA-256 前 8 位、字节数、HTTP 状态码、错误 kind。
+- 日志里只允许出现：操作名、后端类型、对象 key 的 SHA-256 前 8 位、**key 形状**（`devices` / `blobs` / `meta` / `root` / `other`）、字节数、HTTP 状态码、错误 kind。
 - 禁止出现：URL 的 userinfo/query、`Authorization`、口令/密码/Secret Key、条目内容明文、图片文件全路径。
 - 条目 hash 在日志里也只打前 8 位（如 `sync: skip sensitive item 1a2b3c4d`）。
 
@@ -220,14 +220,20 @@ AAD 的作用：把 A 对象的密文挪到 B 对象上会解密失败，避免�
 - **`interval`**：`sync_now`（「立即同步」）、配置保存、删除钩子，以及**本机复制入库**（`clipboard-changed` / `item-deleted` 事件）都会立即唤醒一轮（带去抖，且同步自己写库触发的事件被忽略，避免回环）。
 - 未启用：每 2 秒检查一次配置，无网络请求（两种模式一致）。
 - 失败后下一轮间隔取 `max(轮询间隔, 30 秒)`，成功后恢复（仅 `interval` 模式会自动重试）。
-- 重试：`Network` / `Server` / HTTP 429 最多 3 次尝试，退避 500ms → 2s；`Auth` / `Config` 类错误不重试（**重定向 3xx 与 http 协议降级都算 `Config`**，重试无意义）。
+- 重试：`Network` / `Server` / HTTP 429 最多 **5 次尝试**，退避 **500ms → 2s → 5s → 10s**（累计约 17.5s）；`Auth` / `Config` 类错误不重试（**重定向 3xx 与 http 协议降级都算 `Config`**，重试无意义）。
+  - 为什么是 5 次：校园网/运营商 **DNS 污染是间歇的** —— 同一次同步里第一次解析失败、几秒后重试就成功很常见，多试几次能明显提高成功率。
+  - **DNS 失败单独成文案**：`ErrorKind::Dns` 不再笼统报 `kind=Dns`，而是 `… 域名解析失败（DNS）: key=<8位tag> shape=<devices|blobs|meta>。校园网/DNS 污染环境下常见，请检查网络、DNS 或代理后重试`。
+  - **peer 快照只试 2 次**：远端某个设备快照读不通时不为它等满 4 档退避，失败后该 peer 进入 **60 秒冷却**（`sync-state.json` 的 `peers.<id>.retry_after_ms`），期间不再请求；其它 peer 与本轮同步照常进行，状态栏会提示「N 个设备快照未拉取」。
 - 超时：连接 5s；元数据请求 20s；blob 传输 60s。
+- **连接不复用**：agent 关闭空闲连接池（`max_idle_connections(0)`），GET 另外显式发 `Connection: close`。复用被服务器/代理单方面关闭的 keep-alive 连接，正是 `response body closed before all bytes were read` 的典型来源。
+- **GET 完整性校验**：响应带 `Content-Length` 时按实际读到的字节数核对，不一致报 `… 响应不完整: key=<tag> 期望 N 字节，实际 M 字节`（`Network`，可重试），绝不把半截内容当成功。
 
 ### 6.4 图片
 
 - 先传 blob 再传快照：`HEAD blobs/{hash}.bin` → 不存在则加密后 `PUT`（`If-None-Match: *`，409/412 视为"已存在"，正常跳过）。
 - 接收方解密后写到 `data/images/{hash前16位}.png`（先写 `.tmp` 再 rename），再插库并带 `file_path`。
 - 超过 `max_blob_mb` 或本地文件缺失/读不到的图片，快照里直接跳过。
+- **图片 blob 与富文本副本走的是同一条 GET 路径**（同一个 `Connection: close` + 长度校验 + 重试逻辑，见 6.3）：拉图片/HTML/RTF 时出现「响应不完整」或 `kind=Dns`，排查方式与设备快照完全一致 —— 都是网络侧问题，不需要单独处理。
 
 ### 6.5 富文本副本（HTML / RTF）
 
@@ -268,7 +274,7 @@ AAD 的作用：把 A 对象的密文挪到 B 对象上会解密失败，避免�
 3. 填「设备名」（建议 `DESKTOP-A` / `LAPTOP-B` 这类可辨认的名字）。
 4. 填「口令」（同步口令），点保存 —— 写入凭据管理器 `Sparrow.Sync` / `passphrase`。两台设备用同一串。
 5. 填 WebDAV 密码 或 S3 Secret Key（失焦即保存）。
-6. 点「测试连接」。成功时返回 `连接成功 · N ms`（内部会 MKCOL 建目录、`PUT` 一个探测对象、读回校验、再 `DELETE` 掉）。探测对象的 key 是 **`{root_prefix}/.probe-{uuid}`** —— 命令层只传相对 key `.probe-{uuid}`，`{root_prefix}` 由后端拼；无论成功失败都会尝试删除，远端不会留下垃圾对象。
+6. 点「测试连接」。成功时返回 `连接成功 · N ms`（内部会 MKCOL 建目录、`PUT` 一个 256 KB 伪随机探测对象、逐字节读回校验、再 `DELETE` 掉）。探测对象的 key 是 **`{root_prefix}/.probe-{uuid}`** —— 命令层只传相对 key `.probe-{uuid}`，`{root_prefix}` 由后端拼；无论成功失败都会尝试删除，远端不会留下垃圾对象。用 256 KB 而不是 2 字节，是为了暴露“控制面通、数据面被代理/MTU 截断”的网络（真实故障里出现过测试连接通过、同步大 blob 被截断）。
 7. 选「同步方式」：默认「按间隔轮询」（实时性最好，但会周期性请求存储服务）；若只想每次启动同步一次、平时完全静默，改选「**仅启动时**」——此时不再显示轮询间隔，复制/删除也不会触发同步，只能靠「立即同步」手动拉取。
 8. 打开「启用云同步」。状态点应从 `disabled` 变为 `idle`，随后（`interval` 模式）按轮询间隔周期性变成 `syncing`。
 9. 确认 `device_id` 已生成：打开 `<程序目录>\config\sync-state.json`，应能看到非空 `device_id`（UUID v4）。两台设备的 `device_id` **必须不同**（相同说明两个便携目录共用了同一份 `config/`）。
@@ -380,6 +386,9 @@ AAD 的作用：把 A 对象的密文挪到 B 对象上会解密失败，避免�
 | `409` | `meta.json` 或 blob 已存在（正常并发路径，多数会被自动降级处理）；也可能是 WebDAV 父目录缺失 | 若是持续报错，检查父集合权限 |
 | 证书错误（`certificate` / `tls`） | 自签证书、企业中间人代理、系统时间错误 | 换受信任证书；或给系统装上根证书；校时 |
 | 连接超时 / 一直 `error` | 需要代理但未配置；DNS 或防火墙拦截 | 应用会读 Windows 系统代理设置，先在浏览器里确认能访问；`localhost` 目标不走代理 |
+| **`kind=Dns` /「域名解析失败（DNS）」**（校园网最常见） | **DNS 污染/间歇解析失败**：校园网、运营商对境外域名的解析被投毒或限流，浏览器能打开（走了代理/DoH）但应用直连解析不出来。同一域名时好时坏。实测某校园网：对 `app.koofr.net` 的 **UDP/53 查询被静默丢包**（校园 DNS 与 223.5.5.5 都超时），但 **TCP/53、DoH、443/TLS 全部正常**——说明是 DNS 层拦截，不是域名/IP 被封 | ① **hosts 钉 IP（最快）**：管理员编辑 `C:\Windows\System32\drivers\etc\hosts`，加 `167.235.4.177 app.koofr.net`（备用 `5.9.21.137` / `116.202.160.164`）；证书 `*.koofr.net` 仍然有效。② 开系统代理（Clash / V2Ray，打开「系统代理」或 TUN；应用只读 `ProxyEnable=1` 的 WinINET 设置）。③ Win11 网卡 DNS 设为 `223.5.5.5` / `1.1.1.1` **并启用「通过 HTTPS 的 DNS」**（只改 DNS 地址、仍走 UDP/53 时实测无效）。④ 换热点验证。⑤ 客户端会自动重试 5 次，但网络侧拦截无法根治 |
+| 「`… 响应不完整 …`」/「`response body closed before all bytes were read`」（GET 中途断开） | 大文件（图片/富文本 blob）或代理在传输中途断开连接；MTU/分片被中间设备丢弃；服务器提前关闭 keep-alive | 客户端已加 `Connection: close` + 不复用连接 + 长度校验 + 重试 5 次；若持续出现：检查代理（关闭/换节点）、把 MTU 调到 1400 左右、换网络；单个 peer 快照读不通只会跳过该 peer（60s 冷却），不会阻断整轮 |
+| 状态栏「N 个设备快照未拉取」 | 远端 `devices/` 里有个读不通的对象（常见：第三台旧设备留下的快照、写了一半的对象） | 该 peer 已进入 60s 冷却，其它设备与本机同步不受影响；确认那台设备是否还在用，不再用就删掉远端 `{root_prefix}/devices/<id>.json` |
 | S3 `SignatureDoesNotMatch` | **系统时钟偏差**、`region` 与服务商不一致、endpoint 写成了 IP 却关了 path-style | 同步系统时间（NTP）；核对 region（R2 用 `auto`）；自定义域名/IP 开 `s3_path_style` |
 | `RequestTimeTooSkewed` | 同上，时钟偏差超过 15 分钟 | 校时 |
 | `429` / `503`，反复重试 | 轮询过频被服务商限流（尤其 2 秒间隔 + 大快照） | 把 `poll_interval_sec` 调大到 15–60；缩小条目量；S3 用户注意 LIST 请求计费 |

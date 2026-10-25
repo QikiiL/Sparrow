@@ -19,6 +19,7 @@ pub mod webdav;
 mod e2e_tests;
 
 use std::fmt;
+use std::io::Read;
 use std::time::Duration;
 
 use sha2::{Digest, Sha256};
@@ -31,6 +32,24 @@ use crate::models::sync::SyncSettings;
 pub fn key_tag(key: &str) -> String {
     let digest = Sha256::digest(key.as_bytes());
     digest.iter().take(4).map(|b| format!("{b:02x}")).collect()
+}
+
+/// 对象 key 的**形状**：`devices` / `blobs` / `meta` / `root`（其它一律 `other`）。
+///
+/// 只暴露"这是设备快照、图片密文还是 meta"，用来让日志与错误消息能区分
+/// "同步卡在图片 blob 上"和"同步卡在设备快照上"——完整 key 含设备 ID/路径，
+/// 不进日志。
+pub fn key_prefix(key: &str) -> &'static str {
+    let key = key.trim_matches('/');
+    if key.is_empty() {
+        return "root";
+    }
+    match key.split('/').next().unwrap_or_default() {
+        "devices" => "devices",
+        "blobs" => "blobs",
+        "meta.json" | "meta" => "meta",
+        _ => "other",
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -103,12 +122,19 @@ pub(crate) fn is_loopback(host: &str) -> bool {
 /// [`check_scheme`]，也不会发出明文 http 请求；重定向到 `http://` 同样会被
 /// ureq 以 `InsecureRequestHttpsOnly` 拒绝（同样映射成 `Config`）。
 /// 回环地址保持原样，本地 mock / 自建服务仍可用 http。
+///
+/// **不复用连接。** `max_idle_connections(0)` 关掉 ureq 的空闲连接池
+/// （ureq 2.x 的 pool 在任一上限为 0 时直接 noop）：每条请求都新建连接。
+/// 复用被服务器/代理单方面关闭的 keep-alive 连接，是
+/// `response body closed before all bytes were read` 的典型来源；
+/// 客户端要的是"要么完整拿到、要么明确失败可重试"，省下的那次握手不值当。
 pub(crate) fn build_agent(host: &str, timeout: Duration) -> ureq::Agent {
     let loopback = is_loopback(host);
     let mut builder = ureq::AgentBuilder::new()
         .timeout_connect(CONNECT_TIMEOUT)
         .timeout(timeout)
         .redirects(1)
+        .max_idle_connections(0)
         .https_only(!loopback);
     if !loopback {
         if let Some(proxy) = system_http_proxy() {
@@ -210,6 +236,19 @@ pub(crate) fn status_error(op: &str, key: &str, status: u16) -> SyncError {
     }
 }
 
+/// DNS 解析失败的可读文案（`ErrorKind::Dns`）。
+///
+/// 国内校园网/运营商 DNS 污染下，同一个域名会时好时坏：`kind=Dns` 基本就是
+/// "解析被投毒或暂时解析不出来"，不是配置错误，所以文案直接给出排查方向，
+/// 并保留 key_tag 便于定位是哪个对象（不含 URL/路径/完整 key）。
+pub(crate) fn dns_error_message(op: &str, key: &str) -> String {
+    format!(
+        "{op} 域名解析失败（DNS）: key={} shape={}。校园网/DNS 污染环境下常见，请检查网络、DNS 或代理后重试",
+        key_tag(key),
+        key_prefix(key)
+    )
+}
+
 /// ureq 错误 → `SyncError`。传输层只记录 `ErrorKind`，不带 URL。
 pub(crate) fn transport_error(op: &str, key: &str, e: &ureq::Error) -> SyncError {
     match e {
@@ -224,12 +263,55 @@ pub(crate) fn transport_error(op: &str, key: &str, e: &ureq::Error) -> SyncError
                 "{op} 被拒绝: key={}（非回环地址只允许 https）",
                 key_tag(key)
             )),
+            // DNS 污染是**间歇**的：单次解析失败不代表配置有问题，文案给排查方向，
+            // kind 仍是 Network（可重试），交给上层退避重试。
+            ureq::ErrorKind::Dns => SyncError::network(dns_error_message(op, key)),
             kind => SyncError::network(format!(
-                "{op} 传输失败: key={} kind={kind:?}",
-                key_tag(key)
+                "{op} 传输失败: key={} shape={} kind={kind:?}",
+                key_tag(key),
+                key_prefix(key)
             )),
         },
     }
+}
+
+/// 校验响应体长度：`Content-Length` 与实际读到的字节数不一致即视为不完整。
+///
+/// 代理/中间设备在 keep-alive 连接被单方面关闭时，常常表现为"读到一半 EOF"，
+/// ureq 的 `read_to_end` 在 chunked 或短读时**不报错**，必须自己核对长度。
+/// 消息只带 key_tag 与字节数（不含 URL/路径/内容）。
+pub(crate) fn check_body_complete(
+    op: &str,
+    key: &str,
+    declared: Option<u64>,
+    actual: usize,
+) -> Result<(), SyncError> {
+    match declared {
+        Some(expected) if expected != actual as u64 => Err(SyncError::network(format!(
+            "{op} 响应不完整: key={} 期望 {expected} 字节，实际 {actual} 字节",
+            key_tag(key)
+        ))),
+        _ => Ok(()),
+    }
+}
+
+/// 读完整的 GET 响应体，并按 `Content-Length` 校验完整性。
+///
+/// webdav/s3 两个后端共用：读错误与长度不符都映射成可重试的 `Network`。
+pub(crate) fn read_response_body(
+    op: &str,
+    key: &str,
+    resp: ureq::Response,
+) -> Result<Vec<u8>, SyncError> {
+    let declared = resp
+        .header("Content-Length")
+        .and_then(|v| v.trim().parse::<u64>().ok());
+    let mut buf = Vec::new();
+    resp.into_reader()
+        .read_to_end(&mut buf)
+        .map_err(|e| SyncError::network(format!("{op} 读取响应失败: key={} {e}", key_tag(key))))?;
+    check_body_complete(op, key, declared, buf.len())?;
+    Ok(buf)
 }
 
 /// 把 quick-xml 的 `Event::GeneralRef`（`&quot;`、`&#38;` 之类）解析成字符追加到 `text`。
@@ -431,5 +513,64 @@ mod tests {
         assert!(tag.chars().all(|c| c.is_ascii_hexdigit()));
         assert_eq!(tag, key_tag("sparrow/devices/abc.json"));
         assert_ne!(tag, key_tag("sparrow/devices/abd.json"));
+    }
+
+    /// key 形状：只区分 devices / blobs / meta / root，不泄漏完整 key
+    #[test]
+    fn key_prefix_reveals_shape_only() {
+        assert_eq!(key_prefix("devices/abc.json"), "devices");
+        assert_eq!(key_prefix("blobs/ab/cd.png"), "blobs");
+        assert_eq!(key_prefix("meta.json"), "meta");
+        assert_eq!(key_prefix(""), "root");
+        assert_eq!(key_prefix("/"), "root");
+        assert_eq!(key_prefix("weird/thing"), "other");
+        assert_eq!(key_prefix("devices"), "devices");
+    }
+
+    /// DNS 文案：给出「域名解析失败 / DNS / 代理」三个关键词，
+    /// 且只带 key_tag —— 不能出现完整 key、路径或 URL。
+    #[test]
+    fn dns_error_message_is_actionable_and_redacted() {
+        let key = "sparrow/blobs/very-secret-name.bin";
+        let msg = dns_error_message("MKCOL", key);
+        assert!(msg.contains("域名解析失败"), "缺少 DNS 关键词: {msg}");
+        assert!(msg.contains("DNS"), "缺少 DNS 字样: {msg}");
+        assert!(msg.contains("代理"), "缺少代理建议: {msg}");
+        assert!(msg.contains(&key_tag(key)), "缺少 key_tag: {msg}");
+        assert!(!msg.contains("very-secret-name"), "泄漏了完整 key: {msg}");
+        assert!(!msg.contains("sparrow/blobs"), "泄漏了路径: {msg}");
+        assert!(!msg.contains("http"), "泄漏了 URL/scheme: {msg}");
+
+        // 走一遍真实构造路径：kind 必须是可重试的 Network，且 Display 前缀正确
+        let err = SyncError::network(dns_error_message("MKCOL", key));
+        assert_eq!(err.kind, SyncErrorKind::Network);
+        assert!(err.kind.retryable(), "DNS 失败必须可重试");
+        assert!(err.to_string().starts_with("sync network: "));
+    }
+
+    /// `Content-Length` 与实际字节数不符 → Network（可重试），消息只带 tag + 字节数。
+    #[test]
+    fn body_length_mismatch_is_network_error() {
+        let key = "blobs/a.png";
+        check_body_complete("GET", key, Some(100), 100).expect("长度一致应通过");
+        // 没有 Content-Length（chunked）时不做校验
+        check_body_complete("GET", key, None, 42).expect("无长度头应通过");
+
+        let err = check_body_complete("GET", key, Some(100), 37).expect_err("长度不符必须失败");
+        assert_eq!(err.kind, SyncErrorKind::Network);
+        assert!(err.kind.retryable(), "不完整响应必须可重试");
+        assert!(err.message.contains("响应不完整"), "{}", err.message);
+        assert!(
+            err.message.contains("100"),
+            "应带期望字节数: {}",
+            err.message
+        );
+        assert!(
+            err.message.contains("37"),
+            "应带实际字节数: {}",
+            err.message
+        );
+        assert!(err.message.contains(&key_tag(key)), "应带 key_tag");
+        assert!(!err.message.contains("blobs/a.png"), "不能带完整 key");
     }
 }

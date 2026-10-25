@@ -6,8 +6,6 @@
 //! 条件写（`if_match`）与错误映射的约定见 [`super::backend`] 的 trait 文档；
 //! 日志纪律见 [`super`]：错误消息只带 `key_tag` 与状态码。
 
-use std::io::Read;
-
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use quick_xml::events::Event;
@@ -19,7 +17,8 @@ use crate::models::sync::{SyncSecrets, SyncSettings};
 use super::backend::{ObjectMeta, SyncBackend};
 use super::{
     build_agent, check_scheme, key_tag, object_path, percent_decode, push_general_ref,
-    reject_redirect, root_of, transport_error, validate_key, SyncError, BLOB_TIMEOUT, META_TIMEOUT,
+    read_response_body, reject_redirect, root_of, transport_error, validate_key, SyncError,
+    BLOB_TIMEOUT, META_TIMEOUT,
 };
 
 const PROPFIND_BODY: &str = concat!(
@@ -151,6 +150,9 @@ impl SyncBackend for WebDavBackend {
             .blob
             .get(url.as_str())
             .set("Authorization", &self.auth)
+            // 不复用 keep-alive 连接：服务器/代理单方面关闭空闲连接时，
+            // 复用会让响应体读到一半 EOF（`response body closed before all bytes were read`）。
+            .set("Connection", "close")
             .call()
         {
             Ok(resp) => {
@@ -160,11 +162,7 @@ impl SyncBackend for WebDavBackend {
             Err(ureq::Error::Status(404, _)) => return Ok(None),
             Err(e) => return Err(transport_error("GET", key, &e)),
         };
-        let mut buf = Vec::new();
-        resp.into_reader().read_to_end(&mut buf).map_err(|e| {
-            SyncError::network(format!("GET 读取响应失败: key={} {e}", key_tag(key)))
-        })?;
-        Ok(Some(buf))
+        Ok(Some(read_response_body("GET", key, resp)?))
     }
 
     fn head(&self, key: &str) -> Result<Option<ObjectMeta>, SyncError> {
@@ -482,6 +480,46 @@ mod tests {
         let got = backend(&server).get("devices/x.json").expect("get");
         assert_eq!(got.as_deref(), Some(&b"{}"[..]));
         m.assert_hits(1);
+    }
+
+    /// GET 必须显式要求关闭连接：复用被服务器/代理单方面关闭的 keep-alive
+    /// 连接正是 `response body closed before all bytes were read` 的典型来源。
+    #[test]
+    fn get_sends_connection_close() {
+        let server = MockServer::start();
+        let m = server.mock(|when, then| {
+            when.path("/sparrow/blobs/a.bin")
+                .header("Connection", "close");
+            then.status(200).body("payload");
+        });
+        let got = backend(&server).get("blobs/a.bin").expect("get");
+        assert_eq!(got.as_deref(), Some(&b"payload"[..]));
+        m.assert_hits(1);
+    }
+
+    /// 响应体比 `Content-Length` 短：绝不能当成完整内容返回，必须是可重试的 Network。
+    ///
+    /// httpmock 在 TCP 层就把连接断了，ureq 因此在 `.call()` 阶段报 Io；无论
+    /// 报在哪一层，契约都一样——截断的响应只会变成可重试的 Network 错误。
+    /// 长度校验本身的文案由 `mod.rs::body_length_mismatch_is_network_error` 覆盖。
+    #[test]
+    fn get_short_body_is_network_error() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.path("/sparrow/blobs/truncated.bin");
+            then.status(200)
+                .header("Content-Length", "999")
+                .body("payload");
+        });
+        let err = backend(&server)
+            .get("blobs/truncated.bin")
+            .expect_err("短响应必须报错");
+        assert_eq!(err.kind, SyncErrorKind::Network);
+        assert!(err.kind.retryable(), "截断响应必须可重试");
+        assert!(
+            !err.message.contains("blobs/truncated.bin"),
+            "不能带完整 key"
+        );
     }
 
     #[test]
