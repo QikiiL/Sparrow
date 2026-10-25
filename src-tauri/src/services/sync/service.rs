@@ -1452,7 +1452,14 @@ fn register_wakeup(inner: &Arc<Inner>) {
     for event in LOCAL_CHANGE_EVENTS {
         // 只持 Weak：监听器挂在 AppHandle 上，强引用会让 Inner 永远无法释放
         let weak = Arc::downgrade(inner);
-        let _ = inner.app.listen(event, move |_event| {
+        let _ = inner.app.listen(event, move |event| {
+            // 同步自己写库后 emit 的 `{"action":"synced"}` 不是本地变更：
+            // `applying` 只能拦住 emit 当下，事件若稍后才投递就会漏网并触发
+            // 下一轮，形成“同步中”自激循环。按 payload 明确忽略。
+            let synced = is_synced_payload(event.payload());
+            if synced {
+                return;
+            }
             let Some(inner) = weak.upgrade() else {
                 return;
             };
@@ -1476,6 +1483,19 @@ fn register_wakeup(inner: &Arc<Inner>) {
             });
         });
     }
+}
+
+/// 事件 payload 是否是同步自己发出的 `{"action":"synced"}`。
+/// 纯逻辑，便于单测；解析失败一律当作普通本地变更（宁可多同步一轮）。
+fn is_synced_payload(payload: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(payload)
+        .ok()
+        .and_then(|v| {
+            v.get("action")
+                .and_then(|a| a.as_str())
+                .map(|a| a == "synced")
+        })
+        .unwrap_or(false)
 }
 
 /// 事件到达：代次自增，返回本次事件的代次号（纯逻辑，便于单测）。
@@ -1838,15 +1858,12 @@ async fn run_loop(inner: Arc<Inner>) {
         inner.applying.store(true, Ordering::SeqCst);
         let cycle = run_cycle(&ctx).await;
         if let Ok(report) = &cycle {
-            // 合并进本地库 / 按墓碑删了本地条目 → 前端列表必须重查。
-            // 在 applying 窗口内 emit：监听回调会忽略它（不会引发再同步），
-            // 但前端 WebView 照常收到，列表因此立刻刷新。
-            // 有图片/富文本被跳过时也 emit：前端至少能刷新状态、看到告警。
-            if report.inserted > 0
-                || report.deleted > 0
-                || report.skipped_images > 0
-                || report.skipped_formats > 0
-            {
+            // 只有真的插入/删除了条目才需要让前端重查列表。
+            // **不能**把 skipped_images/skipped_formats 也算进来：跳过会每个周期
+            // 重复出现，emit 的 clipboard-changed 又会唤醒下一轮，形成“同步中”
+            // 永不结束的自激循环（用户实测两台机器一直卡在同步中）。
+            // 跳过信息已经通过 SyncStatus.warning 单独上报。
+            if report.inserted > 0 || report.deleted > 0 {
                 let _ = inner
                     .app
                     .emit(CLIPBOARD_CHANGED, serde_json::json!({"action": "synced"}));
@@ -2276,6 +2293,17 @@ mod tests {
     fn wake_events_are_ignored_in_startup_mode() {
         assert!(!should_wake(SyncMode::Startup), "startup 事件不唤醒");
         assert!(should_wake(SyncMode::Interval), "interval 事件立即唤醒");
+    }
+
+    /// 同步自己 emit 的 `{"action":"synced"}` 不能被当作本地变更唤醒下一轮，
+    /// 否则 skipped 条目每轮重复出现时会形成永不停止的“同步中”。
+    #[test]
+    fn synced_payload_is_not_a_local_change() {
+        assert!(is_synced_payload(r#"{"action":"synced"}"#));
+        assert!(is_synced_payload(r#"{ "action" : "synced" }"#));
+        assert!(!is_synced_payload(r#"{"action":"new"}"#));
+        assert!(!is_synced_payload(""));
+        assert!(!is_synced_payload("not json"));
     }
 
     #[tokio::test]
