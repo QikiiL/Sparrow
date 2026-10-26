@@ -7,9 +7,11 @@ extern "system" {
     fn GetForegroundWindow() -> isize;
     fn SetForegroundWindow(hwnd: isize) -> i32;
     fn GetWindow(hwnd: isize, cmd: u32) -> isize;
-    fn IsWindowVisible(hwnd: isize) -> i32;
     fn IsWindowEnabled(hwnd: isize) -> i32;
-    fn GetWindowLongW(hwnd: isize, nindex: i32) -> i32;
+    fn IsIconic(hwnd: isize) -> i32;
+    fn ShowWindow(hwnd: isize, cmd: i32) -> i32;
+    // 与 foreground_tracker 保持一致:统一用 GetWindowLongPtrW(x64 上的标准取法)
+    fn GetWindowLongPtrW(hwnd: isize, nindex: i32) -> isize;
     fn SetWindowPos(
         hwnd: isize,
         insert_after: isize,
@@ -21,19 +23,14 @@ extern "system" {
     ) -> i32;
 }
 
-#[link(name = "dwmapi")]
-extern "system" {
-    fn DwmGetWindowAttribute(hwnd: isize, attr: u32, out: *mut u32, size: u32) -> i32;
-}
-
 const GW_HWNDNEXT: u32 = 2;
-const DWMWA_CLOAKED: u32 = 14;
 const GWL_EXSTYLE: i32 = -20;
-const WS_EX_TOPMOST: i32 = 0x0000_0008;
+const WS_EX_TOPMOST: isize = 0x0000_0008;
 const SWP_NOSIZE: u32 = 0x0001;
 const SWP_NOMOVE: u32 = 0x0002;
 const SWP_NOACTIVATE: u32 = 0x0010;
 const HWND_TOPMOST: isize = -1;
+const SW_RESTORE: i32 = 9;
 
 /// 焦点交接抑制标志:应用正在把前台交给**外部目标窗口**期间为 true。
 ///
@@ -86,12 +83,18 @@ pub fn capture_foreground_hwnd() -> isize {
 /// 隐藏本应用窗口后,主动把前台焦点还给目标窗口,并等待其真正就绪。
 /// SetForegroundWindow 的调用方需为前台进程或最近接收输入的进程——
 /// 用户刚在我们的窗口里点击过,满足条件。
+/// 目标最小化时先 SW_RESTORE:最小化窗口的 IsWindowVisible 仍为真,但
+/// SetForegroundWindow 对最小化窗口只会闪一下任务栏,焦点不会真正过去,
+/// 随后模拟的 Ctrl+V 就落空(表现为"点了没粘贴")。
 /// 返回目标窗口是否已成为前台。
 pub fn restore_target_focus(hwnd: isize) -> bool {
     if hwnd == 0 {
         return false;
     }
     unsafe {
+        if IsIconic(hwnd) != 0 {
+            ShowWindow(hwnd, SW_RESTORE);
+        }
         for _ in 0..25 {
             if GetForegroundWindow() == hwnd {
                 return true;
@@ -103,6 +106,40 @@ pub fn restore_target_focus(hwnd: isize) -> bool {
     }
 }
 
+/// 发送 Ctrl+V 前的最后一道闸:确认前台确实是要粘贴的窗口。
+///
+/// - `target != 0`(本次粘贴有明确落点):要求 `GetForegroundWindow() == target`;
+/// - `target == 0`(托盘打开、连续粘贴等"无明确落点"的旧路径):要求前台通过
+///   [`crate::utils::foreground_tracker::is_acceptable_paste_foreground`] ——
+///   它排掉任务栏/任务视图/不可激活覆盖层/cloaked/本进程窗口(否则按键会打回
+///   自己的面板搜索框,或"粘进"不可见的任务栏——历史上真实发生过),
+///   但**放行桌面**(「框选文件 → 连贴到桌面」是合法用法)。
+///
+/// 两种情况都最多重试 15×20ms(约 300ms):覆盖焦点切换、以及销毁窗口后
+/// Windows 隐式激活的尾部延迟(机器繁忙时 150ms 往往不够)。
+/// 返回 false 时调用方必须放弃模拟按键(剪贴板内容照常写入,用户手动 Ctrl+V
+/// 仍然可用),宁可"只复制"也绝不把内容粘进错误的软件。
+pub fn wait_for_paste_target(target: isize) -> bool {
+    const ATTEMPTS: usize = 15;
+    for attempt in 0..ATTEMPTS {
+        let foreground = unsafe { GetForegroundWindow() };
+        let ok = if target != 0 {
+            foreground == target
+        } else {
+            // 无明确落点时允许桌面(「框选文件 → 连贴到桌面」是合法用法),
+            // 但任务栏/任务视图/不可激活覆盖层/本进程一律拒绝
+            crate::utils::foreground_tracker::is_acceptable_paste_foreground(foreground)
+        };
+        if ok {
+            return true;
+        }
+        if attempt + 1 < ATTEMPTS {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+    false
+}
+
 /// 窗口是否为当前前台窗口。tao/tauri 的 is_focused 标志基于 WM_ACTIVATE /
 /// WM_SETFOCUS 消息异步更新,窗口刚创建或刚显示时会滞后;
 /// 这里直接用原生 GetForegroundWindow 比对,作为判定兜底。
@@ -112,29 +149,26 @@ pub fn is_foreground_window(hwnd: isize) -> bool {
 
 /// 窗口是否带 WS_EX_TOPMOST 扩展样式(置顶守护线程据此发现置顶被外部剥除)
 pub fn is_topmost(hwnd: isize) -> bool {
-    hwnd != 0 && unsafe { GetWindowLongW(hwnd, GWL_EXSTYLE) } & WS_EX_TOPMOST != 0
+    hwnd != 0 && unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) } & WS_EX_TOPMOST != 0
 }
 
 /// 找出本窗口若被销毁时 Windows 会隐式激活的窗口:Z 序上本窗口下方第一个
 /// 可激活的**普通层**窗口。找不到返回 0。
-/// 「粘贴后保持打开」在唤出前没有可靠目标记录(应用启动即建窗、托盘打开)
-/// 或记录的目标已失效时,用它作为粘贴落点,对齐销毁路径的隐式激活结果。
-/// 必须跳过两类窗口,否则焦点会切到一个粘不进东西的目标上:
-/// - 置顶窗口(WS_EX_TOPMOST):面板自身默认置顶,悬在置顶层,紧挨其下的
-///   是任务栏等置顶壳窗口——粘贴目标(用户正在用的应用)在普通层;
-/// - UWP 幽灵窗口:IsWindowVisible 为真但被 DWM 遮蔽(cloaked)。
+/// 「粘贴后保持打开」在冻结落点为 `Some(0)`(托盘/冷启动没有记录)时的
+/// **最后兜底**,对齐销毁路径的隐式激活结果。
+/// 候选过滤直接复用 `foreground_tracker::is_valid_target`(置顶、壳/桌面、
+/// cloaked、本进程窗口、`WS_EX_NOACTIVATE` 覆盖层全在里面),再加一条
+/// "窗口必须是启用态"——禁用的窗口(模态对话框背后的父窗口)贴不进去。
 pub fn find_window_below(our_hwnd: isize) -> isize {
     unsafe {
         let mut hwnd = GetWindow(our_hwnd, GW_HWNDNEXT);
         while hwnd != 0 {
-            let topmost = GetWindowLongW(hwnd, GWL_EXSTYLE) & WS_EX_TOPMOST != 0;
-            if !topmost {
-                let mut cloaked: u32 = 0;
-                let is_cloaked = DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, &mut cloaked, 4) == 0
-                    && cloaked != 0;
-                if !is_cloaked && IsWindowVisible(hwnd) != 0 && IsWindowEnabled(hwnd) != 0 {
-                    return hwnd;
-                }
+            let topmost = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) & WS_EX_TOPMOST != 0;
+            if !topmost
+                && IsWindowEnabled(hwnd) != 0
+                && crate::utils::foreground_tracker::is_valid_target(hwnd)
+            {
+                return hwnd;
             }
             hwnd = GetWindow(hwnd, GW_HWNDNEXT);
         }

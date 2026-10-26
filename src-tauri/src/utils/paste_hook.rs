@@ -19,12 +19,15 @@ use tauri::AppHandle;
 
 const WH_KEYBOARD_LL: i32 = 13;
 const WM_KEYDOWN: usize = 0x0100;
+const WM_KEYUP: usize = 0x0101;
 const WM_SYSKEYDOWN: usize = 0x0104;
+const WM_SYSKEYUP: usize = 0x0105;
 const WM_QUIT: u32 = 0x0012;
 const LLKHF_INJECTED: u32 = 0x10;
 
-/// 触发键去抖:按住不放的系统自动重复(~30ms/次)不得连续触发
-const DEBOUNCE_MS: u32 = 180;
+/// 卡键自愈阈值:TRIGGER_KEY_DOWN 仍为 true(没收到 keyup)但距上次触发
+/// 已超过这个时长,视为新的一次按下 —— 否则丢一个 keyup 会让钩子永久失效
+const STUCK_RELEASE_MS: u32 = 1500;
 /// 待办步进上限:防疯狂连按把计数器顶上天(正常永远到不了)
 pub const MAX_PENDING: usize = 500;
 
@@ -86,6 +89,10 @@ static UNINSTALLING: AtomicBool = AtomicBool::new(false);
 static CFG_MODS: AtomicU32 = AtomicU32::new(MOD_CTRL);
 static CFG_KEY_VK: AtomicU32 = AtomicU32::new(0);
 static LAST_TRIGGER_TICK: AtomicU32 = AtomicU32::new(0);
+/// 触发键当前是否处于「物理按住」状态:靠 keydown/keyup 配对判断,
+/// 而不是时间窗去抖 —— 快速连按(两次按下间隔 < 180ms)也各有自己的
+/// keyup,必须逐次触发;只有按住不放的系统自动重复(keydown 无 keyup)才吞掉
+static TRIGGER_KEY_DOWN: AtomicBool = AtomicBool::new(false);
 static TRIGGER_APP: OnceLock<AppHandle> = OnceLock::new();
 
 /// 解析设置里的「修饰键+按键」为钩子用的位掩码与 VK 码。
@@ -145,6 +152,8 @@ pub fn install(app: AppHandle, mods: u32, key_vk: u32) -> bool {
     }
 
     let (tx, rx) = std::sync::mpsc::channel::<bool>();
+    // 新装的钩子从「未按下」开始:上一轮可能因卸载时 keyup 丢失而残留 true
+    TRIGGER_KEY_DOWN.store(false, Ordering::SeqCst);
     std::thread::spawn(move || {
         let hmod = unsafe { GetModuleHandleW(std::ptr::null()) };
         let hhook = unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(hook_proc), hmod, 0) };
@@ -171,6 +180,9 @@ pub fn install(app: AppHandle, mods: u32, key_vk: u32) -> bool {
 
 /// 卸载钩子(幂等)。向钩子线程投递 WM_QUIT,由线程自己完成卸载
 pub fn uninstall() {
+    // 卸载期间收不到 keyup,标志必须复位,否则下次武装后第一次按下会被
+    // 当成"按住重复"吞掉(直到卡键自愈阈值才恢复)
+    TRIGGER_KEY_DOWN.store(false, Ordering::SeqCst);
     // 先立 UNINSTALLING 再查 INSTALLED:顺序反了的话,并发 install 会在
     // 两个 store 的间隙里溜过去,装出第二个钩子
     UNINSTALLING.store(true, Ordering::SeqCst);
@@ -208,26 +220,47 @@ fn modifiers_match() -> bool {
     true
 }
 
+/// 一次物理按下是否算「新的触发」:
+/// - 键此前未按下 → 是(正常的一次按下);
+/// - 键仍处于按下状态(系统自动重复,~30ms/次)→ 否;
+/// - 键仍处于按下但距上次触发已超过 [`STUCK_RELEASE_MS`] → 是
+///   (keyup 丢失导致的卡键自愈,避免钩子永久失效)
+fn should_fire(was_down: bool, elapsed_ms: u32) -> bool {
+    !was_down || elapsed_ms > STUCK_RELEASE_MS
+}
+
 unsafe extern "system" fn hook_proc(ncode: i32, wparam: usize, lparam: isize) -> isize {
-    if ncode >= 0 && (wparam == WM_KEYDOWN || wparam == WM_SYSKEYDOWN) {
+    if ncode >= 0 {
         let ll = &*(lparam as *const KbdLlHookStruct);
-        // 只拦物理按键:我们自己模拟的粘贴(注入事件)必须原样放行,
+        // 只认物理按键:我们自己模拟的粘贴(注入事件)必须原样放行,
         // 否则目标应用永远收不到 Ctrl+V
-        if ll.flags & LLKHF_INJECTED == 0
-            && ll.vk_code == CFG_KEY_VK.load(Ordering::SeqCst)
-            && modifiers_match()
-        {
-            let now = unsafe { GetTickCount() };
-            let last = LAST_TRIGGER_TICK.swap(now, Ordering::SeqCst);
-            let debounced =
-                last != 0 && now.wrapping_sub(last) < DEBOUNCE_MS;
-            if !debounced {
-                if let Some(app) = TRIGGER_APP.get() {
-                    crate::services::continuous_paste::on_physical_trigger(app);
-                }
+        let physical_trigger =
+            ll.flags & LLKHF_INJECTED == 0 && ll.vk_code == CFG_KEY_VK.load(Ordering::SeqCst);
+        match wparam {
+            // 松开触发键:清掉「按住」标志,下一次按下才算新触发。
+            // keyup 绝不吞 —— 目标应用需要它结束自己的按键状态
+            WM_KEYUP | WM_SYSKEYUP if physical_trigger => {
+                TRIGGER_KEY_DOWN.store(false, Ordering::SeqCst);
             }
-            // 无论是否去抖,物理触发键都吞掉:按住不放的自动重复不许打进输入框
-            return 1;
+            WM_KEYDOWN | WM_SYSKEYDOWN if physical_trigger && modifiers_match() => {
+                let now = unsafe { GetTickCount() };
+                let last = LAST_TRIGGER_TICK.load(Ordering::SeqCst);
+                let elapsed = if last == 0 {
+                    u32::MAX
+                } else {
+                    now.wrapping_sub(last)
+                };
+                let was_down = TRIGGER_KEY_DOWN.swap(true, Ordering::SeqCst);
+                if should_fire(was_down, elapsed) {
+                    LAST_TRIGGER_TICK.store(now, Ordering::SeqCst);
+                    if let Some(app) = TRIGGER_APP.get() {
+                        crate::services::continuous_paste::on_physical_trigger(app);
+                    }
+                }
+                // 物理触发键一律吞掉:按住不放的自动重复不许打进输入框
+                return 1;
+            }
+            _ => {}
         }
     }
     unsafe { CallNextHookEx(0, ncode, wparam, lparam) }
@@ -250,5 +283,26 @@ mod tests {
         assert_eq!(parse_trigger("Ctrl+Shift", "P"), Some((MOD_CTRL | MOD_SHIFT, 0x50)));
         assert_eq!(parse_trigger("", "V"), None, "裸键不允许:会吞掉正常打字");
         assert_eq!(parse_trigger("Ctrl", "F5"), None, "仅支持字母/数字键");
+    }
+
+    #[test]
+    fn fire_on_first_press() {
+        // 首次按下:无论距上次触发多久都要触发
+        assert!(should_fire(false, u32::MAX));
+        assert!(should_fire(false, 5));
+    }
+
+    #[test]
+    fn ignore_auto_repeat_while_held() {
+        // 按住不放:系统自动重复(~30ms/次)不得重复出队
+        assert!(!should_fire(true, 30));
+        assert!(!should_fire(true, STUCK_RELEASE_MS - 1));
+    }
+
+    #[test]
+    fn self_heal_stuck_key() {
+        // keyup 丢失的卡键:超过阈值仍视为新按下,钩子不会永久失效
+        assert!(should_fire(true, STUCK_RELEASE_MS + 1));
+        assert!(should_fire(true, 60_000));
     }
 }

@@ -252,12 +252,34 @@ pub async fn run_once(app: &AppHandle) -> Result<(), String> {
         state.add_pending_step();
         return Ok(());
     }
-    let mut result = run_once_inner(app).await;
-    while result.is_ok() && state.take_pending_step() {
-        state.renew_delivery();
+    // 循环体第一句就赋值,break 只可能发生在赋值之后
+    let mut result;
+    loop {
         result = run_once_inner(app).await;
+        if result.is_err() {
+            // 出错退出:释放 busy,让用户能重试这一条
+            state.exit_delivery();
+            break;
+        }
+        state.renew_delivery();
+        if state.take_pending_step() {
+            continue;
+        }
+        // 先释放 busy,再最后检查一次:在"检查 pending"与"释放 busy"之间
+        // 到达的触发会看到 busy 并记入 pending,这里必须接住
+        state.exit_delivery();
+        if state.take_pending_step() {
+            if state.try_enter_delivery() {
+                state.renew_delivery();
+                continue;
+            }
+            // 被并发 run_once 接管:把步进还回去,由它消费
+            state.add_pending_step();
+        }
+        // 正常退出:busy 已在上面释放,**不能**在 break 后再清一次 ——
+        // 期间可能已有并发 run_once 重新占用 busy,清掉会让第三个投递并发进入
+        break;
     }
-    state.exit_delivery();
     result
 }
 
@@ -272,15 +294,21 @@ async fn run_once_inner(app: &AppHandle) -> Result<(), String> {
             return Ok(());
         };
         // 队列开始后窗口通常已销毁,前台即目标应用,不动焦点 —— 粘贴落进
-        // 用户当前光标所在的输入框;窗口还开着时(面板内点「粘贴下一条」)
-        // 先销毁窗口并把焦点还给唤出前记录的目标。「粘贴后保持打开」不影响
-        // 此路径:开始连贴时面板本来就会立即隐藏
+        // 用户当前光标所在的输入框;窗口还开着时(面板内点「粘贴下一条」,
+        // 或「粘贴后保持打开」下开始连贴)按 keep_open_on_paste 决定:
+        // 开启 → 保留面板、只把焦点交给落点;关闭 → 先销毁窗口并把焦点
+        // 还给唤出前记录的目标
+        let keep_open = load_settings(app).keep_open_on_paste;
         let handling = if app
             .get_webview_window("main")
             .map(|w| w.is_visible().unwrap_or(false))
             .unwrap_or(false)
         {
-            paste_service::FocusHandling::HideFirst
+            if keep_open {
+                paste_service::FocusHandling::KeepOpen
+            } else {
+                paste_service::FocusHandling::HideFirst
+            }
         } else {
             paste_service::FocusHandling::AtTarget
         };
@@ -295,9 +323,17 @@ async fn run_once_inner(app: &AppHandle) -> Result<(), String> {
         )
         .await
         {
-            Ok(paste_service::Delivery::Delivered) => {
+            Ok(paste_service::Delivery::Delivered { pasted }) => {
                 let was_last = state.is_empty();
-                state.mark_pasted(id);
+                // 只有真的发出 Ctrl+V 才算「已粘贴」。pasted=false 表示落点
+                // 校验没过(前台不是目标应用、桌面/任务栏等):内容已写进
+                // 剪贴板,队列照常推进,但**不**标记已粘贴 —— 否则 UI 会显示
+                // "已粘贴 n/N"而实际什么都没粘
+                if pasted {
+                    state.mark_pasted(id);
+                } else {
+                    eprintln!("[continuous] item {} not pasted — copied only", id);
+                }
                 if was_last {
                     // 最后一条投完:立即卸钩并标记完成,把 Ctrl+V 还给系统,
                     // 不必等下一次触发才发现队列已空

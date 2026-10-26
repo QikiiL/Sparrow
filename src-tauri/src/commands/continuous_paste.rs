@@ -29,7 +29,8 @@ async fn precheck_items(app: &AppHandle, ids: &[i64]) -> Result<(), String> {
 }
 
 /// 开始连续粘贴(FIFO)。只武装,不立即粘贴:武装物理触发钩子后
-/// 隐藏窗口、把焦点交还目标应用,第一条等用户按下触发热键(默认 Ctrl+V)
+/// 隐藏窗口、把焦点交还目标应用(「粘贴后保持打开」开启时保留面板,
+/// 只交焦点),第一条等用户按下触发热键(默认 Ctrl+V)
 #[tauri::command]
 pub async fn start_continuous_paste(
     app: tauri::AppHandle,
@@ -48,13 +49,37 @@ pub async fn start_continuous_paste(
         eprintln!("连续粘贴触发钩子武装失败,只能通过面板按钮逐条粘贴");
     }
     // 隐藏窗口、焦点交还目标应用,但第一条不投 —— 等用户的第一次按键。
-    // 窗口在本调用内被销毁,返回值大概率送不到前端,进度走事件
-    if app
+    // 「粘贴后保持打开」开启时改为不销毁面板、只把焦点交给落点。
+    // 窗口在销毁路径里于本调用内被销毁,返回值大概率送不到前端,进度走事件
+    let visible_hwnd = app
         .get_webview_window("main")
-        .map(|w| w.is_visible().unwrap_or(false))
-        .unwrap_or(false)
-    {
-        crate::services::paste_service::release_focus_to_target(&app).await;
+        .filter(|w| w.is_visible().unwrap_or(false))
+        .and_then(|w| w.hwnd().ok())
+        .map(|h| h.0 as isize);
+    if let Some(hwnd) = visible_hwnd {
+        // 与单击条目同源:先冻结落点(最近外部前台窗口 > 唤出时捕获的目标),
+        // 再把焦点交过去 —— 用户可能是唤出面板后又切到别的应用才
+        // 开始连贴,陈旧的捕获目标会把焦点抢回旧窗口。
+        // 冻结值只按参数传递,不写回 PasteMode(写回会污染唤出瞬间的捕获值)。
+        // 全程**只冻结一次**:keep-open 与销毁两条路径共用同一个落点
+        let target = crate::services::paste_service::freeze_target_from_state(&app);
+        let keep_open = crate::services::settings_service::load_settings(&app).keep_open_on_paste;
+        // Some(0)(无记录)也允许走 keep-window 的 Z 序兜底;None 才必须销毁
+        let kept = keep_open
+            && target.is_some()
+            && crate::services::paste_service::focus_target_keep_window(&app, target.unwrap())
+                .await;
+        if kept {
+            // 保持打开:面板留在屏幕上,只把焦点交给落点。焦点交接期间
+            // 置顶样式可能被系统抹掉,补一次强制置顶(不抢焦点)
+            crate::utils::input_focus::force_topmost(hwnd);
+        } else {
+            // 关掉保持打开(或 keep-open 交接失败):销毁面板。
+            // 冻结不到落点(None)时仍然销毁面板(连贴必须离开面板),但不强行
+            // 激活任何窗口 —— 后续每条都会因"无落点"降级为仅复制
+            crate::services::paste_service::release_focus_to_target(&app, target.unwrap_or(0))
+                .await;
+        }
     }
     Ok(state.status_snapshot())
 }

@@ -33,7 +33,9 @@ pub async fn activate_item(
     )
     .await?
     {
-        crate::services::paste_service::Delivery::Delivered => Ok(()),
+        // pasted=false(发送前校验没过,只写了剪贴板)对单击路径同样是"已投递":
+        // 内容在剪贴板里,用户可以手动 Ctrl+V
+        crate::services::paste_service::Delivery::Delivered { .. } => Ok(()),
         crate::services::paste_service::Delivery::Missing => Err("Item not found".to_string()),
     }
 }

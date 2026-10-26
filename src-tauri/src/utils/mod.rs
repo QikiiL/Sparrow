@@ -1,3 +1,4 @@
+pub mod foreground_tracker;
 pub mod hash;
 pub mod hotkey;
 pub mod input_focus;

@@ -79,6 +79,10 @@ export const useContinuousPasteStore = create<ContinuousPasteStore>((set, get) =
           selectionOrder: [],
           bandPreview: EMPTY_SET,
           orderById: new Map(),
+          // status/pastedIds 也要清:否则结束后重建的窗口仍显示"已粘贴"
+          // 高亮(ClipboardItem 的 data-pasted 绿色样式)
+          status: null,
+          pastedIds: EMPTY_SET,
           lastError: null,
           lastClickedId: null,
         });
@@ -189,6 +193,9 @@ export const useContinuousPasteStore = create<ContinuousPasteStore>((set, get) =
       get().applyStatus(s);
       // 后端队列仍在进行(窗口销毁期间按过热键):重建的窗口直接回到执行视图
       if (s.active) set({ mode: true });
+      // 上一轮已结束(完成/取消):不要借 active=false 的旧快照把 mode 翻回来,
+      // 同时清掉 status/pastedIds —— 否则模式结束后条目仍是绿色「已粘贴」
+      else if (s.total > 0) set({ mode: false, status: null, pastedIds: EMPTY_SET });
     } catch {
       // 后端不可用(理论上不会发生):保持默认空状态
     }

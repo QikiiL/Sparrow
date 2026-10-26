@@ -44,8 +44,9 @@ fn choose_text_write_path(html: Option<&[u8]>, rtf: Option<&[u8]>) -> TextWriteP
 
 /// 单击条目的目标行为
 pub enum DeliverMode {
-    /// 写入剪贴板后模拟 Ctrl+V,粘贴到之前聚焦的输入框
-    Paste,
+    /// 写入剪贴板后模拟 Ctrl+V,粘贴到 `target`(本次冻结的落点;
+    /// 0 = 无明确落点,只要求前台不是本进程的窗口)
+    Paste { target: isize },
     /// 仅写入剪贴板,不模拟按键
     CopyOnly,
 }
@@ -164,6 +165,11 @@ fn write_files_to_clipboard(paths: Vec<String>) -> Result<(), String> {
 /// 调用前需先隐藏本应用窗口,确保按键落到目标应用上。
 /// html_path/rtf_path 非空且文件可读时,文本分支改走多格式原子写回;
 /// 文件缺失/读失败自动降级为纯文本,不报错中断粘贴。
+///
+/// `DeliverMode::Paste { target }` 携带本次粘贴冻结的落点(0 = 无明确落点)。
+/// 模拟按键前用 [`crate::utils::input_focus::wait_for_paste_target`] 再校验
+/// 一次前台,不匹配就**不发** Ctrl+V(剪贴板照常写入),宁可"只复制"也不
+/// 粘进错误的软件。返回值 = 是否真的模拟了按键(false = 仅复制)。
 pub async fn deliver_content(
     app_handle: tauri::AppHandle,
     content: &str,
@@ -172,12 +178,15 @@ pub async fn deliver_content(
     html_path: Option<&str>,
     rtf_path: Option<&str>,
     mode: DeliverMode,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let content = content.to_string();
     let file_path = file_path.map(|s| s.to_string());
     let html_path = html_path.map(|s| s.to_string());
     let rtf_path = rtf_path.map(|s| s.to_string());
-    let do_paste = matches!(mode, DeliverMode::Paste);
+    let (do_paste, target) = match mode {
+        DeliverMode::Paste { target } => (true, target),
+        DeliverMode::CopyOnly => (false, 0),
+    };
     tokio::task::spawn_blocking(move || {
         let wrote = match item_type {
             t if t == ClipboardType::Text as i32 || t == ClipboardType::Link as i32 => {
@@ -225,33 +234,51 @@ pub async fn deliver_content(
         if do_paste {
             // 写入剪贴板后等待其生效;跳过写入时也给焦点切换留一点余量
             thread::sleep(Duration::from_millis(if wrote { 50 } else { 30 }));
-            simulate_paste()?;
+            // 最后一道闸:前台必须就是要粘贴的窗口。焦点没到位(目标被
+            // 抢走/已关闭/前台仍是本面板)就不发按键 —— 剪贴板已写好,
+            // 用户手动 Ctrl+V 仍然可用,绝不把内容粘进错误的软件
+            if crate::utils::input_focus::wait_for_paste_target(target) {
+                simulate_paste()?;
+                Ok(true)
+            } else {
+                eprintln!(
+                    "[paste] foreground is not paste target {} — copy only (Ctrl+V not sent)",
+                    target
+                );
+                Ok(false)
+            }
+        } else {
+            Ok(false)
         }
-        Ok(())
     })
     .await
     .map_err(|e| e.to_string())?
 }
 
-/// 投递结果:Delivered = 已写入剪贴板并(按模式)模拟按键;
+/// 投递结果:Delivered = 已写入剪贴板,`pasted` 表示**是否真的模拟了按键**
+/// (false = 仅复制:发送前校验没过,内容在剪贴板里但没发 Ctrl+V);
 /// Missing = 条目已不存在(连续粘贴用它跳过被删除的条目)
 pub enum Delivery {
-    Delivered,
+    Delivered { pasted: bool },
     Missing,
 }
 
 /// 投递前的焦点处理方式。单击条目(activate_item)与连续粘贴共用此核心,
 /// 差异只有这里:
-/// - HideFirst(面板内点击,默认):先销毁窗口,把前台焦点还给唤出前
-///   记录的目标窗口并等待其就绪,否则模拟的 Ctrl+V 会在焦点切换完成前落空;
+/// - HideFirst(面板内点击,默认):先销毁窗口,把前台焦点还给本次冻结的
+///   粘贴落点并等待其就绪,否则模拟的 Ctrl+V 会在焦点切换完成前落空;
+///   「仅复制」时只销毁面板、**不**归还焦点;
 /// - KeepOpen(「粘贴后保持打开」开启):窗口不销毁,仅把前台焦点交给
-///   粘贴落点 —— 面板留在屏幕上,方便连续粘贴多条。落点优先取唤出前
-///   记录的目标窗口,没有记录(启动即建窗、托盘打开)或已失效时退回
-///   Z 序下第一个可激活窗口(对齐销毁路径的隐式激活);两者都失败时
-///   退回 HideFirst 的销毁路径保证内容仍被粘贴,只有该路径也失败才
-///   降级为仅复制(此刻前台仍是本面板,模拟按键会落进自己的搜索框);
+///   粘贴落点 —— 面板留在屏幕上,方便连续粘贴多条。落点同样取本次冻结值,
+///   只有 `target == 0`(托盘/冷启动没有记录)才退回 Z 序下第一个可激活窗口
+///   (对齐销毁路径的隐式激活);失败时退回 HideFirst 的销毁路径保证内容
+///   仍被粘贴,只有该路径也失败才降级为仅复制(此刻前台仍是本面板,模拟
+///   按键会落进自己的搜索框);
 /// - AtTarget(连续粘贴的全局触发):前台已经是目标应用,不动焦点 ——
 ///   粘贴总是落进用户当前光标所在的输入框。
+///
+/// 「本次冻结的粘贴落点」见 `deliver_item_by_id` 开头的快照与
+/// `utils::foreground_tracker`(最近外部前台窗口 > 唤出时捕获的目标 > 0)。
 pub enum FocusHandling {
     HideFirst,
     KeepOpen,
@@ -260,35 +287,34 @@ pub enum FocusHandling {
 
 /// 不销毁窗口,把前台焦点切到粘贴落点并等待其就绪,返回是否成功。
 /// 「粘贴后保持打开」路径专用;销毁版见 release_focus_to_target。
-/// 落点优先取唤出前记录的目标窗口;没有记录(应用启动即建窗、托盘打开)
-/// 或记录已失效时,退回 Z 序下第一个可激活窗口 —— 对齐销毁路径里 Windows
-/// 的隐式激活,保证粘贴落点与"关掉开关"时一致。全部失败才返回 false,
-/// 由调用方降级为仅复制。
-async fn refocus_target_keep_window(app_handle: &tauri::AppHandle) -> bool {
-    let captured = app_handle
-        .state::<crate::utils::input_focus::PasteMode>()
-        .target();
+/// 落点优先用本次冻结的目标。`target != 0` 时**只认它**(失败即交调用方降级);
+/// `target == 0`(托盘/冷启动没有记录)才退回 Z 序下第一个可激活窗口 ——
+/// 对齐销毁路径里 Windows 的隐式激活,保证粘贴落点与"关掉开关"时一致。
+/// 全部失败返回 false,由调用方降级。
+async fn refocus_target_keep_window(app_handle: &tauri::AppHandle, target: isize) -> bool {
     let our_hwnd = app_handle
         .get_webview_window("main")
         .map(|w| w.hwnd().map(|h| h.0 as isize).unwrap_or(0))
         .unwrap_or(0);
     tauri::async_runtime::spawn_blocking(move || {
         let mut candidate = 0;
-        let result = if captured != 0 && captured != our_hwnd
-            && crate::utils::input_focus::restore_target_focus(captured)
-        {
-            true
+        let result = if target != 0 && target != our_hwnd {
+            // 有明确落点:不做 Z 序兜底 —— 兜底选出的窗口与 target 不同,
+            // 发送前校验必然拦下,白折腾一轮;直接失败交调用方走销毁路径
+            crate::utils::input_focus::restore_target_focus(target)
         } else if our_hwnd != 0 {
+            // find_window_below 复用 is_valid_target(置顶/壳/桌面/cloaked/
+            // 本进程/NOACTIVATE 全排除),再要求窗口是启用态
             candidate = crate::utils::input_focus::find_window_below(our_hwnd);
             candidate != 0 && crate::utils::input_focus::restore_target_focus(candidate)
         } else {
             false
         };
         // 诊断:落点决策打一行 stderr(tauri dev 终端可见;release 为窗口
-        // 程序不落任何输出)。candidate=0 且成功 = 走的记录目标
+        // 程序不落任何输出)。candidate=0 且成功 = 走的冻结目标
         eprintln!(
             "[keep-open] target={} self={} candidate={} focused={}",
-            captured, our_hwnd, candidate, result
+            target, our_hwnd, candidate, result
         );
         result
     })
@@ -296,29 +322,60 @@ async fn refocus_target_keep_window(app_handle: &tauri::AppHandle) -> bool {
     .unwrap_or(false)
 }
 
-/// 销毁窗口并把前台焦点还给唤出前记录的目标窗口(不投递任何内容)。
+/// 「粘贴后保持打开」的连续粘贴启动/步进:只把焦点交给冻结落点,不销毁面板。
+/// `target` 由调用方**一次性**冻结后传入(不要在这里再冻结一次:两次冻结会
+/// 读到不同的跟踪快照)。`Some(0)` 允许走 Z 序兜底,`None` 由调用方拦截。
+/// 返回 false = 交接失败,调用方决定是否退回销毁路径。
+pub async fn focus_target_keep_window(app_handle: &tauri::AppHandle, target: isize) -> bool {
+    // 焦点交接期间抑制 ensure_focus 抢回焦点,守卫随作用域结束解除
+    let _handoff = FocusHandoffGuard::new();
+    refocus_target_keep_window(app_handle, target).await
+}
+
+/// 销毁窗口并把前台焦点还给本次冻结的粘贴落点(不投递任何内容)。
 /// 单击条目投递的"先隐藏"分支、连续粘贴「只武装、不立即粘贴」的
 /// 启动路径,以及 keep-open 找不到落点时的降级路径共用。
-/// 返回是否已把前台交给一个可用目标(供降级路径判断要不要退回仅复制)
-pub async fn release_focus_to_target(app_handle: &tauri::AppHandle) -> bool {
+/// 返回是否已把前台交给一个可用目标(供调用方决定要不要退回仅复制)
+pub async fn release_focus_to_target(app_handle: &tauri::AppHandle, target: isize) -> bool {
     // 先销毁窗口(隐藏即销毁,WebView2 进程树随之退出),
-    // 再主动把前台焦点还给唤出前的目标窗口并等待其真正就绪;
+    // 再主动把前台焦点还给落点窗口并等待其真正就绪;
     // 若不等待,后续模拟的 Ctrl+V 会在焦点切换完成前发出而落空
     crate::utils::window_manager::destroy_main_window(app_handle);
-    let target_hwnd = app_handle
-        .state::<crate::utils::input_focus::PasteMode>()
-        .target();
-    if target_hwnd != 0 {
+    if target != 0 {
         tauri::async_runtime::spawn_blocking(move || {
-            crate::utils::input_focus::restore_target_focus(target_hwnd)
+            crate::utils::input_focus::restore_target_focus(target)
         })
         .await
         .unwrap_or(false)
     } else {
-        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-        // 无记录目标:靠 Windows 销毁窗口后的隐式激活,前台非空即视为可用
-        crate::utils::input_focus::capture_foreground_hwnd() != 0
+        // 无冻结落点:靠 Windows 销毁窗口后的隐式激活。这里不能"睡一会儿再
+        // 看一眼" —— 机器繁忙时销毁 + 隐式激活可能慢于固定延时,读到的还是
+        // 自己正在销毁的窗口,于是静默降级成仅复制。复用发送前那套轮询,
+        // 并且要求前台通过 is_valid_target(排除壳/桌面/cloaked/本进程)
+        tauri::async_runtime::spawn_blocking(|| {
+            crate::utils::input_focus::wait_for_paste_target(0)
+        })
+        .await
+        .unwrap_or(false)
     }
+}
+
+/// 冻结本次粘贴的落点:以 `PasteMode` 里"热键唤出时捕获的目标"为兜底,
+/// 优先用跟踪器记录的最近外部前台窗口(见 `utils::foreground_tracker`)。
+///
+/// 只读不写:冻结值全程按参数传递(见 [`DeliverMode::Paste`] /
+/// [`release_focus_to_target`]),**不写回** `PasteMode` —— 写回会把
+/// "唤出瞬间捕获值"永久污染成上次粘贴的应用,跟踪器失效时的回退就一路
+/// 错到底。
+///
+/// 单击条目(deliver_item_by_id)与连续粘贴的启动路径共用。
+/// 返回 `None` = 本次不该激活任何窗口(只复制),`Some(0)` = 没有记录但允许
+/// 走老路径(Z 序兜底/隐式激活),`Some(hwnd)` = 明确落点。
+pub fn freeze_target_from_state(app_handle: &tauri::AppHandle) -> Option<isize> {
+    let captured = app_handle
+        .state::<crate::utils::input_focus::PasteMode>()
+        .target();
+    crate::utils::foreground_tracker::freeze_paste_target(captured)
 }
 
 /// 焦点交接守卫:把前台交给外部目标窗口期间抑制 `ensure_focus` 抢回焦点。
@@ -350,6 +407,27 @@ pub async fn deliver_item_by_id(
     do_paste: bool,
     suppress_ms: u64,
 ) -> Result<Delivery, String> {
+    // ① 冻结本次粘贴的落点 —— 必须在任何窗口隐藏/销毁/异步等待**之前**:
+    //    用户点条目后前台已经是我们自己的面板,再也读不到他真正想去的地方。
+    //    三态穿过调用方(见 foreground_tracker::freeze_paste_target):
+    //    None = 本次只复制、不激活任何窗口;Some(0) = 无记录但允许 Z 序兜底/
+    //    隐式激活;Some(hwnd) = 明确落点。
+    //    仅复制(do_paste=false)不冻结 —— 不碰焦点,白跑 DWM/类名探测没意义。
+    //    连续粘贴(AtTarget)不动焦点,落点就是用户当前光标处。
+    let frozen = if do_paste {
+        match handling {
+            FocusHandling::HideFirst | FocusHandling::KeepOpen => {
+                freeze_target_from_state(app_handle)
+            }
+            FocusHandling::AtTarget => Some(0),
+        }
+    } else {
+        None
+    };
+    // 冻结不到落点 → 本次退化为仅复制:内容照写剪贴板,绝不发 Ctrl+V
+    let mut do_paste = do_paste && frozen.is_some();
+    let target = frozen.unwrap_or(0);
+
     let db = app_handle.state::<SqlitePool>();
     let row = sqlx::query_as::<
        _,
@@ -365,7 +443,6 @@ pub async fn deliver_item_by_id(
         None => return Ok(Delivery::Missing),
     };
 
-    let mut do_paste = do_paste;
     // 焦点交接抑制:作用域必须覆盖到 simulate_paste 之后(写剪贴板与随后的
     // 等待仍在 ensure_focus 的重试窗口内),故守卫活到函数返回,由 Drop 统一
     // 解除。AtTarget 不动焦点,无需抑制
@@ -375,13 +452,30 @@ pub async fn deliver_item_by_id(
     };
     match handling {
         FocusHandling::HideFirst => {
-            // 销毁窗口时 ensure_focus 线程会因窗口消失而自然退出,
-            // 显式抑制让销毁前的最后几次 set_focus 也停手
-            release_focus_to_target(app_handle).await;
+            if do_paste {
+                // 销毁窗口时 ensure_focus 线程会因窗口消失而自然退出,
+                // 显式抑制让销毁前的最后几次 set_focus 也停手
+                if !release_focus_to_target(app_handle, target).await {
+                    // 焦点没能交给落点:不盲发 Ctrl+V(会粘进错误的窗口),
+                    // 剪贴板已写入,按"仅复制"处理
+                    eprintln!(
+                        "[paste] focus handoff to target {} failed — copy only",
+                        target
+                    );
+                    do_paste = false;
+                }
+            } else {
+                // 「仅复制」/冻结不到落点:面板照旧关闭(保留"点一下有反应"的
+                // 观感),但**绝不**归还焦点 / SetForegroundWindow —— 否则
+                // "只复制"也会把前台切回唤出前的应用
+                crate::utils::window_manager::destroy_main_window(app_handle);
+            }
         }
         FocusHandling::KeepOpen => {
+            // 仅复制 / 冻结不到落点:面板保持打开、不动焦点(N1:这里绝不能
+            // 落到 refocus 的 Z 序兜底,否则"点了桌面"会变成"粘进随机窗口")
             if do_paste {
-                if refocus_target_keep_window(app_handle).await {
+                if refocus_target_keep_window(app_handle, target).await {
                     // 交接焦点后重申本窗口置顶(幂等,SWP_NOACTIVATE 不抢焦点):
                     // 目标窗口被激活时可能把面板压到后面,视觉上像"被盖住"
                     let our_hwnd = app_handle
@@ -397,7 +491,7 @@ pub async fn deliver_item_by_id(
                     // 改走销毁窗口的可靠路径 —— 窗口销毁后 Windows 隐式激活目标
                     // 窗口,内容一定能粘出去;该路径也失败才退回仅复制
                     eprintln!("[keep-open] no usable target — degrading to HideFirst path");
-                    if !release_focus_to_target(app_handle).await {
+                    if !release_focus_to_target(app_handle, target).await {
                         eprintln!("[keep-open] HideFirst fallback failed too — copy only");
                         do_paste = false;
                     }
@@ -414,7 +508,7 @@ pub async fn deliver_item_by_id(
     monitor.set_suppress(true).await;
 
     let mode = if do_paste {
-        DeliverMode::Paste
+        DeliverMode::Paste { target }
     } else {
         DeliverMode::CopyOnly
     };
@@ -448,7 +542,9 @@ pub async fn deliver_item_by_id(
         }
     }
 
-    result.map(|()| Delivery::Delivered)
+    // 把"是否真的发了按键"带出去:连续粘贴据此决定要不要标记「已粘贴」
+    // (以前一律当成功,UI 会显示"已粘贴 n/N"但实际只复制)
+    result.map(|pasted| Delivery::Delivered { pasted })
 }
 
 #[cfg(test)]

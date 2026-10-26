@@ -198,6 +198,13 @@ pub fn run() {
             // 单击条目的目标行为(默认粘贴,可在状态栏手动切换)与粘贴目标窗口
             app.manage(utils::input_focus::PasteMode::new());
 
+            // 最近外部前台窗口跟踪器:粘贴落点必须在"点击条目那一刻"确定,
+            // 而热键唤出时的捕获只反映唤出瞬间的前台。面板默认置顶且失焦
+            // 不隐藏,用户"唤出面板 → 点另一个应用的输入框 → 回来点条目"
+            // 是常规操作,靠陈旧捕获会把内容粘回上一个软件(见
+            // utils/foreground_tracker)。线程随进程存活,失败降级为轮询
+            utils::foreground_tracker::start();
+
             // 连续粘贴(框选模式)的 FIFO 队列:窗口"隐藏即销毁"会带走前端
             // 状态,队列必须活在整个应用生命周期里
             app.manage(services::continuous_paste::ContinuousPasteState::new());

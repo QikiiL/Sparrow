@@ -150,7 +150,8 @@ export const ClipboardItemCard = memo(function ClipboardItemCard({
     (s) => s.mode && (s.selectedIds.has(item.id) || s.bandPreview.has(item.id))
   );
   const boxOrder = useContinuousPasteStore((s) => s.orderById.get(item.id) ?? null);
-  const boxUsed = useContinuousPasteStore((s) => s.pastedIds.has(item.id));
+  // 已粘贴标记只在框选模式内生效:模式结束后 pastedIds 残留也不该继续高亮
+  const boxUsed = useContinuousPasteStore((s) => s.mode && s.pastedIds.has(item.id));
 
   useEffect(() => () => window.clearTimeout(tipCloseTimer.current), []);
 
