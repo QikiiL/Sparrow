@@ -1,6 +1,8 @@
-# 交接文档：剪雀 Sparrow 2.1.0（云同步）
+# 交接文档：剪雀 Sparrow 1.1.0（云同步）
 
-面向接手 2.1.0 发布与后续维护的人。读完应能独立完成：构建、双设备验收、发版，并知道这一版**刻意没做什么**。
+> 版本编号说明：本文档已按新编号体系重写——更名前（Clipboard）为 0.x，更名后（Sparrow）从 1.0.0 起。文中 commit 哈希、产物体积/SHA-256、日期为原始记录，未随之改动。
+
+面向接手 1.1.0 发布与后续维护的人。读完应能独立完成：构建、双设备验收、发版，并知道这一版**刻意没做什么**。
 
 ---
 
@@ -8,14 +10,14 @@
 
 | 项目 | 值 |
 | --- | --- |
-| 版本 | **2.1.0** |
+| 版本 | **1.1.0** |
 | 分支 | `feat/cloud-sync` |
 | HEAD | `81ae7a8`（`fix: store sync blobs as .dat for Koofr WebDAV`） |
-| 目标 Release | `v2.1.0` |
+| 目标 Release | `v1.1.0` |
 | 分支 URL | https://github.com/QikiiL/Sparrow/tree/feat/cloud-sync |
 | 版本文件 | 仓库根 `version.json`（应用内更新检查读它） |
 
-2.1.0 的核心增量只有一个：**WebDAV / S3 兼容对象存储的端到端加密云同步**。其余改动都是围绕它的加固与修复（见第 5 节）。
+1.1.0 的核心增量只有一个：**WebDAV / S3 兼容对象存储的端到端加密云同步**。其余改动都是围绕它的加固与修复（见第 5 节）。
 
 ---
 
@@ -117,7 +119,7 @@
 | 文件 | 说明 |
 | --- | --- |
 | `docs/CLOUD-SYNC.md` | 面向用户的配置与验收手册（配置项总表、安全模型、双设备步骤）。改行为必须同步更新它 |
-| `docs/HANDOVER-2.1.0.md` | 本文件：面向接手者的实现与发布说明 |
+| `docs/HANDOVER-1.1.0.md` | 本文件：面向接手者的实现与发布说明 |
 
 ---
 
@@ -158,7 +160,7 @@
 
 ## 6. 构建与验证
 
-以下为 2.1.0 发布构建的实测结果：
+以下为 1.1.0 发布构建的实测结果：
 
 | 项目 | 命令 | 结果 |
 | --- | --- | --- |
@@ -172,7 +174,7 @@
 | 产物 | 大小 | SHA-256 |
 | --- | --- | --- |
 | `src-tauri/target/release/sparrow.exe` | 28,180,992 B | `8d4d1f08d0f42c821e2c8bb978ed63af700b8cf731dd9ce84b53299067c9b3a7` |
-| `src-tauri/target/release/bundle/nsis/Sparrow_2.1.0_x64-setup.exe` | 7,241,417 B | `14adab63d4f9897b78920df63a021166960649da7f4bb1ca2c3c056d193e583a` |
+| `src-tauri/target/release/bundle/nsis/Sparrow_1.1.0_x64-setup.exe` | 7,241,417 B | `14adab63d4f9897b78920df63a021166960649da7f4bb1ca2c3c056d193e583a` |
 
 注意：`cargo test`（不带 `--lib`）在提权环境外会因 `build.rs` 给 bin target 链接了 `requireAdministrator` manifest 而报 os error 740。**只跑 `--lib`**，这是设计如此，不是回归。
 
@@ -183,7 +185,7 @@
 前提：两台设备都能访问同一个 WebDAV 目录或 S3 桶；口令（同步口令）由你自定，两端**必须一致**。
 
 1. **退出旧进程**：两台设备都先从托盘「退出」旧版（确认任务管理器里没有残留 `sparrow.exe`），否则旧进程会继续写库。
-2. **安装 2.1.0**：直接覆盖安装。安装器会读取旧版卸载项记录的安装位置并原地升级，`config/`、`data/`、历史记录全部保留。
+2. **安装 1.1.0**：直接覆盖安装。安装器会读取旧版卸载项记录的安装位置并原地升级，`config/`、`data/`、历史记录全部保留。
 3. **先让附件多的那台同步**：进入 设置 → 云同步，填后端与根路径、设置同步口令，点「测试连接」（会真上传 256KB，能压到数据面），然后「立即同步」。观察进度到 **上传附件 i/n** 阶段并跑完。这一轮会重传全部附件（约 28MB），耗时取决于上行带宽。
 4. **另一台再同步**：同样配置后「立即同步」，此时应看到 **同步条目 i/n** 以及附件下载进度。
 5. **检查落地**：
@@ -215,7 +217,7 @@
 | 无断点续传 | 大附件中断需整份重传 |
 | LWW 无逐条冲突 UI | 冲突按 `updated_at` 静默裁决，用户看不到"被覆盖了哪一条" |
 | Windows-only | 依赖 clipboard-win / winreg / CF_HDROP |
-| `version.json` 已是 2.1.0 | 应用内更新检查以它为准，发版前不要再改 |
+| `version.json` 已是 1.1.0 | 应用内更新检查以它为准，发版前不要再改 |
 
 ---
 
@@ -231,11 +233,11 @@
 
 ## 10. 发布检查清单
 
-- [ ] `version.json`：`version` = `2.1.0`，`github` 指向 `releases/tag/v2.1.0`，`lanzou` / `lanzou_password` 保持原值，JSON 合法且为 UTF-8 无 BOM
-- [ ] `docs/HANDOVER-2.1.0.md` 已随分支提交
+- [ ] `version.json`：`version` = `1.1.0`，`github` 指向 `releases/tag/v1.1.0`，`lanzou` / `lanzou_password` 保持原值，JSON 合法且为 UTF-8 无 BOM
+- [ ] `docs/HANDOVER-1.1.0.md` 已随分支提交
 - [ ] PR：`feat/cloud-sync` → `main`，合并前确认 CI / 本地 `cargo test --lib`、`npx vitest run`、`npx tsc --noEmit` 全绿
-- [ ] 打 tag `v2.1.0` 并推送
-- [ ] Release asset：上传 `Sparrow_2.1.0_x64-setup.exe`（可同时附 `sparrow.exe`）
+- [ ] 打 tag `v1.1.0` 并推送
+- [ ] Release asset：上传 `Sparrow_1.1.0_x64-setup.exe`（可同时附 `sparrow.exe`）
 - [ ] hash 校验：按第 6 节的两个 SHA-256 与字节数核对上传后的文件
 - [ ] 两端复测：按第 7 节完整走一遍双设备验收，确认 `data/images`、`data/formats` 有内容且无状态告警
-- [ ] 发布说明：直接复用 `version.json` 的 `notes`，提醒用户首次同步会重传全部附件、两端都要 2.1.0
+- [ ] 发布说明：直接复用 `version.json` 的 `notes`，提醒用户首次同步会重传全部附件、两端都要 1.1.0

@@ -1,8 +1,10 @@
-# 交接文档：剪雀 Sparrow 2.1.1（粘贴目标与连续粘贴修复）
+# 交接文档：剪雀 Sparrow 1.1.1（粘贴目标与连续粘贴修复）
 
-面向接手 2.1.1 维护的人。读完应能独立完成：构建、真机验收、发版，并知道这一版为什么这样改、哪些是刻意保留的取舍。
+> 版本编号说明：本文档已按新编号体系重写——更名前（Clipboard）为 0.x，更名后（Sparrow）从 1.0.0 起。文中 commit 哈希与日期为原始记录；§6 的产物体积/SHA-256 为 1.1.1 重建后的实测值。
 
-**上游基线**：2.1.0（`42f957f`，`feat/cloud-sync` 合并后的 `master`）。2.1.0 的云同步架构、加密参数、同步语义见 `docs/HANDOVER-2.1.0.md`，本文不重复。
+面向接手 1.1.1 维护的人。读完应能独立完成：构建、真机验收、发版，并知道这一版为什么这样改、哪些是刻意保留的取舍。
+
+**上游基线**：1.1.0（`42f957f`，`feat/cloud-sync` 合并后的 `master`）。1.1.0 的云同步架构、加密参数、同步语义见 `docs/HANDOVER-1.1.0.md`，本文不重复。
 
 ---
 
@@ -10,16 +12,16 @@
 
 | 项目 | 值 |
 | --- | --- |
-| 版本 | **2.1.1** |
+| 版本 | **1.1.1** |
 | 分支 | `master` |
 | 修复提交 | `fd8ae39`（`fix: correct paste target handoff and continuous paste state`） |
-| 发布提交 | `5a3fcb6`（`chore: release 2.1.1`） |
-| 标签 | `v2.1.1`（附注标签） |
-| GitHub Release | https://github.com/QikiiL/Sparrow/releases/tag/v2.1.1 |
-| 安装包 | `sparrow-setup.exe` / `Sparrow_2.1.1_x64-setup.exe` |
+| 发布提交 | `5a3fcb6`（`chore: release 2.1.1`，提交信息为原始记录，未按新编号改写） |
+| 标签 | `v1.1.1`（附注标签） |
+| GitHub Release | https://github.com/QikiiL/Sparrow/releases/tag/v1.1.1 |
+| 安装包 | `sparrow-setup.exe` / `Sparrow_1.1.1_x64-setup.exe` |
 | 便携版 | `sparrow.exe` |
 
-2.1.1 只做缺陷修复，不改云同步协议与数据库结构；2.1.0 的同步数据、配置可直接沿用。
+1.1.1 只做缺陷修复，不改云同步协议与数据库结构；1.1.0 的同步数据、配置可直接沿用。
 
 ---
 
@@ -187,12 +189,12 @@
 | 文件 | 说明 |
 | --- | --- |
 | `docs/KEEP-OPEN-DESIGN.md` | keep-open 设计、焦点落点优先级、连贴 keep-open 行为、已知边界 |
-| `docs/HANDOVER-2.1.1.md` | 本文件 |
-| `docs/RELEASE.md` | 发版流程（版本号 5 处 + package-lock、打包、标签、Release） |
+| `docs/HANDOVER-1.1.1.md` | 本文件 |
+| `docs/RELEASE.md` | 发版流程（版本号 6 处、打包、标签、Release） |
 
 ---
 
-## 6. 构建与验证（2.1.1 实测）
+## 6. 构建与验证（1.1.1 实测）
 
 | 项目 | 命令 | 结果 |
 | --- | --- | --- |
@@ -213,8 +215,8 @@
 
 | 产物 | 大小 | SHA-256 |
 | --- | --- | --- |
-| `sparrow-setup.exe`（NSIS） | 7,185,618 B | `098f45d5c0812093bce5b10dedaa7afc7af25d9e2189b1e4fcaa863a6546c866` |
-| `sparrow.exe`（便携版） | 28,230,656 B | `2ea2918eef66cd90ca22fed573cc08242d9b957ace9d012146e064f9f983349f` |
+| `sparrow-setup.exe`（NSIS） | 7,187,559 B | `df3d20712370724eb3790753b80b0d40be10123a3d978ad839a9c62f375b0a4d` |
+| `sparrow.exe`（便携版） | 28,225,024 B | `2a3252c3a9c9bb8bc0fb9ab0dc44ffe415b64b2d5cb4245a8318f2a8d7c2c30b` |
 
 GitHub Release 资产名固定为 `sparrow-setup.exe` / `sparrow.exe`；本地仓库根目录保留同版本副本（`.exe` 被 `.gitignore` 忽略）。
 
@@ -225,19 +227,19 @@ GitHub Release 资产名固定为 `sparrow-setup.exe` / `sparrow.exe`；本地�
 | 项目 | 值 |
 | --- | --- |
 | 修复提交 | `fd8ae39` |
-| 版本提交 | `5a3fcb6`（`chore: release 2.1.1`） |
-| 标签 | `v2.1.1` |
-| Release | https://github.com/QikiiL/Sparrow/releases/tag/v2.1.1（非草稿/非预发布） |
+| 版本提交 | `5a3fcb6`（`chore: release 2.1.1`，提交信息为原始记录，未按新编号改写） |
+| 标签 | `v1.1.1` |
+| Release | https://github.com/QikiiL/Sparrow/releases/tag/v1.1.1（非草稿/非预发布） |
 | Release target | `master` |
-| 已推送 | `master`、`v2.1.1` tag |
-| 更新通道 | `version.json` 已为 2.1.1，`github` 指向 v2.1.1 |
+| 已推送 | `master`、`v1.1.1` tag |
+| 更新通道 | `version.json` 已为 1.1.1，`github` 指向 v1.1.1 |
 
 发版顺序（本次实际执行，避免更新通道先于资产）：
 
 1. 提交修复 + 版本号（6 个文件：`package.json`、`package-lock.json`、`src-tauri/tauri.conf.json`、`src-tauri/Cargo.toml`、`src-tauri/Cargo.lock`、`version.json`）。
 2. `npm run tauri build` 出安装包与便携版。
-3. `git push origin v2.1.1`（只推 tag，不动 master）。
-4. 用 `gh release create v2.1.1 ... sparrow-setup.exe sparrow.exe` 创建 Release 并上传资产。
+3. `git push origin v1.1.1`（只推 tag，不动 master）。
+4. 用 `gh release create v1.1.1 ... sparrow-setup.exe sparrow.exe` 创建 Release 并上传资产。
 5. 确认 Release 非草稿、资产大小正确后，`git push origin master`，让 `version.json` 更新通道生效。
 
 > 蓝奏云是长期目录分享，不随版本改地址：<https://wwbwp.lanzoul.com/b00ybd8mej>（密码 `bdlx`）。**新版安装包需要手动上传**；本次发布只完成了 GitHub Release，蓝奏云未自动上传。
@@ -256,8 +258,8 @@ GitHub Release 资产名固定为 `sparrow-setup.exe` / `sparrow.exe`；本地�
 | 托盘溢出区 | `NotifyIconOverflowWindow` / `TopLevelWindowForOverflowXamlIsland` 被 Ignore，落点回落到溢出前应用；若 Windows 再改类名，表现为“从溢出区打开后只复制”。 |
 | keep-open 连贴中途降级 | 若每步 `refocus` 失败（目标被抢/窗口消失），`deliver_item_by_id` 仍会退回 `HideFirst` 销毁面板；这是保证内容粘出去的既有降级路径。 |
 | HWND 回收 | 冻结到粘贴之间目标进程恰退出、句柄被复用，理论上可能粘错；概率极低，未做额外防护。 |
-| 剪贴板 DB 仍未加密 | 2.1.0 的已知限制沿用：加密只发生在同步层，本机 `data/clipboard.db` 明文。 |
-| 同步限制 | 2.1.0 的单周期无总超时、blob 串行、无断点续传、LWW 无逐条 UI 等限制不变。 |
+| 剪贴板 DB 仍未加密 | 1.1.0 的已知限制沿用：加密只发生在同步层，本机 `data/clipboard.db` 明文。 |
+| 同步限制 | 1.1.0 的单周期无总超时、blob 串行、无断点续传、LWW 无逐条 UI 等限制不变。 |
 | 仅复制模式无反馈 | 内容已进剪贴板，面板照常关闭（keep-open 时保留），但没有 toast；需要时在前端加轻量提示。 |
 
 ---
