@@ -168,7 +168,7 @@ pub fn spawn(app_handle: tauri::AppHandle) {
                 match identity::ensure_identity_registered() {
                     Ok(()) => {
                         // 重试订阅前先刷新过期注册:稀疏包版本或清单内容若与
-                        // 当前不一致(如 0.2.1.3 → 0.2.1.4 新增 SmsHelper 条目),
+                        // 当前不一致(如 0.2.1.4 → 0.2.1.5 新增 SmsHelper 条目),
                         // 旧注册会让激活 helper 的 AUMID 找不到对应条目
                         if let Err(stale_err) = identity::reregister_if_stale() {
                             eprintln!(

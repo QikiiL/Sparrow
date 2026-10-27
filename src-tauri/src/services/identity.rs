@@ -202,7 +202,7 @@ fn is_registered() -> bool {
 /// (改清单版本时必须同步改这里,否则会被误判为「过期」而反复重装)。
 /// 四元组含 Revision:仅比 (Major,Minor,Build) 无法区分内容过期但版本
 /// 三元组相同的注册(实测踩过:0.2.1.2 与 0.2.1.3 前三位相同)。
-const EXPECTED_IDENTITY_VERSION: (u64, u64, u64, u64) = (0, 2, 1, 4);
+const EXPECTED_IDENTITY_VERSION: (u64, u64, u64, u64) = (0, 2, 1, 5);
 
 /// 已注册的稀疏包版本是否与 EXPECTED_IDENTITY_VERSION 完全一致。
 /// 不一致(含「清单元数据里 Executable 指向旧 exe」的场景,版本相同但内容过期)

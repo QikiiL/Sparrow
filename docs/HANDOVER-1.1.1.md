@@ -215,8 +215,10 @@
 
 | 产物 | 大小 | SHA-256 |
 | --- | --- | --- |
-| `sparrow-setup.exe`（NSIS） | 7,187,559 B | `df3d20712370724eb3790753b80b0d40be10123a3d978ad839a9c62f375b0a4d` |
-| `sparrow.exe`（便携版） | 28,225,024 B | `2a3252c3a9c9bb8bc0fb9ab0dc44ffe415b64b2d5cb4245a8318f2a8d7c2c30b` |
+| `sparrow-setup.exe`（NSIS） | 7,186,292 B | `82945f18163781941bf4d49499711b802a73045bdbf77ba9cf2d896c679dbea3` |
+| `sparrow.exe`（便携版） | 28,225,024 B | `5122ccb653a549cc42c040376dc93f8133646a579902c8c8683fbc1d02136673` |
+
+> 注意：1.1.1 发布后补了一个 identity 版本常量修复（`EXPECTED_IDENTITY_VERSION` 0.2.1.4 → 0.2.1.5，与 AppxManifest 对齐），上表为**修复后**重新构建的产物。
 
 GitHub Release 资产名固定为 `sparrow-setup.exe` / `sparrow.exe`；本地仓库根目录保留同版本副本（`.exe` 被 `.gitignore` 忽略）。
 
