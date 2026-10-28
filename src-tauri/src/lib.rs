@@ -378,6 +378,8 @@ pub fn run() {
             commands::continuous_paste::cancel_continuous_paste,
             commands::settings::save_settings,
             commands::settings::load_settings,
+            commands::settings::get_autostart_status,
+            commands::settings::repair_autostart,
             commands::settings::allow_excluded_item,
             commands::settings::set_keep_open,
             commands::sync::get_sync_status,

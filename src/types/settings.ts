@@ -28,6 +28,18 @@ export interface AppSettings {
   sync: SyncSettings;
 }
 
+/** 开机自启动在系统里的真实状态(后端 get_autostart_status / repair_autostart 返回) */
+export interface AutostartStatus {
+  /** 任务存在且按预期参数(--minimized)注册 */
+  configured: boolean;
+  /** 系统里存在同名计划任务 */
+  task_exists: boolean;
+  /** 任务指向的可执行文件(取自计划任务 XML 的 <Command>) */
+  task_target: string | null;
+  /** 任务存在且指向当前运行的程序 —— 判断「真的会开机启动」的依据 */
+  ready: boolean;
+}
+
 export const DEFAULT_SETTINGS: AppSettings = {
   start_with_windows: false,
   retention_days: 30,

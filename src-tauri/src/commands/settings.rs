@@ -1,4 +1,5 @@
 use crate::models::settings::AppSettings;
+use crate::services::settings_service::AutostartStatus;
 use tauri::Manager;
 
 #[tauri::command]
@@ -11,6 +12,28 @@ pub fn load_settings(app_handle: tauri::AppHandle) -> Result<AppSettings, String
 #[tauri::command]
 pub fn save_settings(app_handle: tauri::AppHandle, settings: AppSettings) -> Result<(), String> {
     crate::services::settings_service::save_settings(&app_handle, &settings)
+}
+
+/// 开机自启动的真实状态。设置面板打开时查一次:配置文件里的布尔值只代表
+/// 用户意图,任务可能被安全软件/清理工具删掉,两者必须分开显示
+#[tauri::command]
+pub fn get_autostart_status(_app_handle: tauri::AppHandle) -> AutostartStatus {
+    let exe = std::env::current_exe()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_default();
+    crate::services::settings_service::autostart_status(&exe)
+}
+
+/// 「立即修复」:按当前 exe 重建自启动任务(enable_autostart 内部会回查校验),
+/// 返回修复后的真实状态供前端直接刷新提示
+#[tauri::command]
+pub fn repair_autostart(_app_handle: tauri::AppHandle) -> Result<AutostartStatus, String> {
+    let exe = std::env::current_exe()
+        .map_err(|e| format!("无法获取当前程序路径: {}", e))?
+        .to_string_lossy()
+        .to_string();
+    crate::services::settings_service::enable_autostart(&exe)?;
+    Ok(crate::services::settings_service::autostart_status(&exe))
 }
 
 /// 「粘贴后保持打开」:开启后单击条目不销毁面板,只把前台焦点还给目标窗口。

@@ -3,7 +3,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { getVersion } from '@tauri-apps/api/app';
 import { useTheme } from '../contexts/ThemeContext';
 import { useClipboardStore } from '../stores/clipboardStore';
-import type { AppSettings } from '../types/settings';
+import type { AppSettings, AutostartStatus } from '../types/settings';
 import { DEFAULT_SETTINGS } from '../types/settings';
 import { XIcon, ResetIcon } from './icons';
 import { PromptDialog } from './Dialogs';
@@ -78,6 +78,10 @@ export function SettingsPanel({ isOpen, onClose }: Props) {
   const [addingPattern, setAddingPattern] = useState(false);
   // 短信验证码功能状态(权限/最近捕获),来自后端轮询
   const [smsStatus, setSmsStatus] = useState<SmsCodeStatus | null>(null);
+  // 开机自启动在系统里的真实状态:配置里的布尔值只是"用户意图",
+  // 任务可能被安全软件/清理工具删掉,两者要分开看
+  const [autostartStatus, setAutostartStatus] = useState<AutostartStatus | null>(null);
+  const [repairingAutostart, setRepairingAutostart] = useState(false);
   // 标题右侧版本徽章
   const [appVersion, setAppVersion] = useState<string | null>(null);
   // settingsRef 始终持有最新设置,避免回调闭包读到旧值
@@ -97,6 +101,29 @@ export function SettingsPanel({ isOpen, onClose }: Props) {
     setSettings(next);
   }, []);
 
+  // 回读后端真实设置。保存失败时用它把 UI(尤其是开关)拨回真实值
+  const reloadSettings = useCallback(async () => {
+    try {
+      const s = await invoke<AppSettings>('load_settings');
+      const merged = { ...DEFAULT_SETTINGS, ...s };
+      applySettings(merged);
+      savedRef.current = merged;
+      setPaused(s.paused);
+      setWinVEnabled(s.win_v_integration ?? false);
+      return merged;
+    } catch (err) {
+      console.error('Reload settings failed:', err);
+      return null;
+    }
+  }, [applySettings, setPaused]);
+
+  // 查询系统里自启动任务的真实状态(任务是否存在、指向哪个 exe)
+  const refreshAutostartStatus = useCallback(() => {
+    invoke<AutostartStatus>('get_autostart_status')
+      .then(setAutostartStatus)
+      .catch(console.error);
+  }, []);
+
   useEffect(() => {
     if (isOpen) {
       invoke<AppSettings>('load_settings').then((s) => {
@@ -107,6 +134,8 @@ export function SettingsPanel({ isOpen, onClose }: Props) {
         setPaused(s.paused);
         setWinVEnabled(s.win_v_integration ?? false);
       }).catch(console.error);
+      // 每次打开设置页都核对一次系统启动项:配置说开 ≠ 系统真的注册了
+      refreshAutostartStatus();
       setRecording(null);
       recordingRef.current = null;
       setClearConfirmOpen(false);
@@ -118,7 +147,7 @@ export function SettingsPanel({ isOpen, onClose }: Props) {
         .then(setAppVersion)
         .catch(() => {});
     }
-  }, [isOpen, setPaused, applySettings]);
+  }, [isOpen, setPaused, applySettings, refreshAutostartStatus]);
 
   // 短信验证码状态:面板打开时加载,并每 3 秒刷新——用户被引导去
   // 系统设置里授权,回来后状态行要能自动变成「已开启」,不需要手动刷新
@@ -177,8 +206,10 @@ export function SettingsPanel({ isOpen, onClose }: Props) {
     return () => document.removeEventListener('keydown', handleEscape);
   }, [isOpen, onClose, clearConfirmOpen]);
 
-  // 即改即存:应用新值并持久化;paused 变化时同步监听开关
-  const saveNow = useCallback(async (next: AppSettings) => {
+  // 即改即存:应用新值并持久化;paused 变化时同步监听开关。
+  // 返回是否保存成功:失败(例如开机自启动任务同步失败)时回读后端真实值
+  // 把 UI 拨回去,并用 alert 明确告知——GUI 没有控制台,静默失败等于骗用户
+  const saveNow = useCallback(async (next: AppSettings): Promise<boolean> => {
     const prev = settingsRef.current;
     applySettings(next);
     try {
@@ -192,10 +223,14 @@ export function SettingsPanel({ isOpen, onClose }: Props) {
       useClipboardStore
         .getState()
         .setMaxItems(next.max_item_count > 0 ? next.max_item_count : 100000);
+      return true;
     } catch (err) {
       console.error('Auto-save settings failed:', err);
+      await reloadSettings();
+      alert('设置保存失败: ' + err);
+      return false;
     }
-  }, [applySettings, setPaused]);
+  }, [applySettings, setPaused, reloadSettings]);
 
   // 热键类修改需先注册成功再保存,失败则回读后端恢复原值
   const saveHotkey = useCallback(async (next: AppSettings) => {
@@ -209,15 +244,9 @@ export function SettingsPanel({ isOpen, onClose }: Props) {
     } catch (err) {
       console.error('Register hotkey failed:', err);
       alert('快捷键注册失败: ' + err);
-      invoke<AppSettings>('load_settings')
-        .then((s) => {
-          const merged = { ...DEFAULT_SETTINGS, ...s };
-          applySettings(merged);
-          savedRef.current = merged;
-        })
-        .catch(console.error);
+      void reloadSettings();
     }
-  }, [applySettings, saveNow]);
+  }, [saveNow, reloadSettings]);
 
   // Hotkey recording handler(唤出热键与连续粘贴热键共用录制逻辑)
   const handleRecordKeyDown = useCallback((e: KeyboardEvent) => {
@@ -319,8 +348,30 @@ export function SettingsPanel({ isOpen, onClose }: Props) {
     }
   };
 
-  const handleToggleAutostart = () => {
-    void saveNow({ ...settingsRef.current, start_with_windows: !settingsRef.current.start_with_windows });
+  // 开机自启动:保存失败(任务没建成)时开关会被 saveNow 回读后端真实值拨回,
+  // 并弹窗说明原因;成功与否都刷新一次系统真实状态
+  const handleToggleAutostart = async () => {
+    const next = !settingsRef.current.start_with_windows;
+    await saveNow({ ...settingsRef.current, start_with_windows: next });
+    refreshAutostartStatus();
+  };
+
+  // 「立即修复」:按当前程序重建系统启动项(后端会回查校验任务指向)
+  const handleRepairAutostart = async () => {
+    setRepairingAutostart(true);
+    try {
+      const status = await invoke<AutostartStatus>('repair_autostart');
+      setAutostartStatus(status);
+      if (!status.ready) {
+        alert('修复失败: 系统启动项仍未指向当前程序');
+      }
+    } catch (err) {
+      console.error('Repair autostart failed:', err);
+      alert('修复开机自启动失败: ' + err);
+      refreshAutostartStatus();
+    } finally {
+      setRepairingAutostart(false);
+    }
   };
 
   const handleTogglePaused = () => {
@@ -473,6 +524,21 @@ export function SettingsPanel({ isOpen, onClose }: Props) {
                 label="开机自启动"
               />
             </Row>
+            {/* 配置说开、系统里却没任务:必须显式提示,否则用户永远以为已生效 */}
+            {settings.start_with_windows && autostartStatus && !autostartStatus.ready && (
+              <div className="flex items-start gap-2 px-3.5 pb-[11px]">
+                <p className="flex-1 text-[11px] leading-[1.5] text-warn-text">
+                  系统启动项未注册（可能被清理），开机不会自动启动
+                </p>
+                <button
+                  onClick={handleRepairAutostart}
+                  disabled={repairingAutostart}
+                  className={ghostBtn}
+                >
+                  {repairingAutostart ? '修复中…' : '立即修复'}
+                </button>
+              </div>
+            )}
             <Row title="暂停监听" desc="开启后复制的内容不再记录">
               <Switch checked={settings.paused} onChange={handleTogglePaused} label="暂停监听" />
             </Row>

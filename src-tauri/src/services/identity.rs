@@ -27,7 +27,7 @@
 //! 因此**不得**引用 `crate::` 下的任何项(含 lib.rs 的 exe_dir),依赖只限
 //! windows/std —— 看似重复的本地辅助函数是有意保留的。
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use windows::core::HSTRING;
@@ -204,10 +204,16 @@ fn is_registered() -> bool {
 /// 三元组相同的注册(实测踩过:0.2.1.2 与 0.2.1.3 前三位相同)。
 const EXPECTED_IDENTITY_VERSION: (u64, u64, u64, u64) = (0, 2, 1, 5);
 
-/// 已注册的稀疏包版本是否与 EXPECTED_IDENTITY_VERSION 完全一致。
-/// 不一致(含「清单元数据里 Executable 指向旧 exe」的场景,版本相同但内容过期)
-/// 时返回 false,调用方应强制重注册 —— 否则旧注册会让新进程拿不到身份,
-/// 触发「无身份 → 重启」死循环。
+/// 已注册的稀疏包是否「可以直接用」:版本与 EXPECTED_IDENTITY_VERSION 完全一致,
+/// **且**包的实际根目录(ExternalLocation)就是当前 exe 所在目录。
+///
+/// 只比版本是不够的:调试构建(tauri dev)会把同名同版本的包注册到
+/// `src-tauri\target\debug`,安装版再启动时版本一致 → 误判「已注册」,
+/// 之后激活 sms-helper 实际指向 debug 目录;该目录被清理后,登录时就弹
+/// 「Windows 找不到文件 ...\target\debug\sms-helper.exe」。
+/// 版本不一致(含「清单元数据里 Executable 指向旧 exe」)同样返回 false,
+/// 调用方应强制重注册 —— 否则旧注册会让新进程拿不到身份,触发
+/// 「无身份 → 重启」死循环。
 fn registered_version_matches() -> bool {
     let Ok(pm) = PackageManager::new() else {
         return false;
@@ -224,12 +230,96 @@ fn registered_version_matches() -> bool {
     let Ok(ver) = pkg.Id().and_then(|id| id.Version()) else {
         return false;
     };
-    (
+    let version_ok = (
         ver.Major as u64,
         ver.Minor as u64,
         ver.Build as u64,
         ver.Revision as u64,
-    ) == EXPECTED_IDENTITY_VERSION
+    ) == EXPECTED_IDENTITY_VERSION;
+    if !version_ok {
+        return false;
+    }
+
+    // 版本对上了,再核对包根目录。读不到(注册表被保护/结构变化)就退回
+    // 旧行为,避免每次启动都做一次昂贵的重注册
+    let Ok(full_name) = pkg.Id().and_then(|id| id.FullName()) else {
+        return true;
+    };
+    let Some(root) = registered_root_folder(&full_name.to_string_lossy()) else {
+        return true;
+    };
+    // 普通(非稀疏)安装的根目录在 WindowsApps 下,不是外部内容目录,不适用本判断
+    if is_windowsapps_path(&root) {
+        return true;
+    }
+    let Some(exe_dir) = exe_dir() else {
+        return true;
+    };
+    same_dir(&root, &exe_dir)
+}
+
+/// 读已注册包的 `PackageRootFolder`(稀疏包的真实外部内容目录)。
+/// 稀疏包的 `Package.InstalledLocation` 只给 WindowsApps 下的存根,
+/// WinRT 拿不到外部位置,只能读包的注册表项。
+fn registered_root_folder(package_full_name: &str) -> Option<PathBuf> {
+    use winreg::enums::HKEY_CURRENT_USER;
+    let subkey = format!(
+        "Software\\Classes\\Local Settings\\Software\\Microsoft\\Windows\\CurrentVersion\\AppModel\\Repository\\Packages\\{}",
+        package_full_name
+    );
+    winreg::RegKey::predef(HKEY_CURRENT_USER)
+        .open_subkey(subkey)
+        .ok()?
+        .get_value::<String, _>("PackageRootFolder")
+        .ok()
+        .map(PathBuf::from)
+}
+
+/// 目录判等用的归一化:统一分隔符、转小写、去 `\\?\` 前缀、去尾部分隔符
+fn normalize_dir(p: &Path) -> String {
+    let s = p.to_string_lossy().replace('/', "\\").to_ascii_lowercase();
+    let s = s.strip_prefix(r"\\?\").unwrap_or(&s);
+    s.trim_end_matches('\\').to_string()
+}
+
+fn same_dir(a: &Path, b: &Path) -> bool {
+    normalize_dir(a) == normalize_dir(b)
+}
+
+fn is_windowsapps_path(p: &Path) -> bool {
+    normalize_dir(p).starts_with(r"c:\program files\windowsapps")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{normalize_dir, same_dir};
+    use std::path::Path;
+
+    #[test]
+    fn same_dir_ignores_case_slashes_and_trailing_separator() {
+        assert!(same_dir(
+            Path::new(r"D:\clipboard"),
+            Path::new(r"d:/Clipboard/")
+        ));
+        assert!(same_dir(
+            Path::new(r"\\?\D:\clipboard"),
+            Path::new(r"D:\clipboard")
+        ));
+    }
+
+    #[test]
+    fn same_dir_rejects_debug_build_dir() {
+        // 事故现场:包被注册到 debug 目录,安装目录在 D:\clipboard
+        assert!(!same_dir(
+            Path::new(r"D:\copy\clipboard-manager-tauri\src-tauri\target\debug"),
+            Path::new(r"D:\clipboard")
+        ));
+    }
+
+    #[test]
+    fn normalize_dir_trims_trailing_separators() {
+        assert_eq!(normalize_dir(Path::new(r"D:\clipboard\\")), "d:\\clipboard");
+    }
 }
 
 /// 强制重注册:移除同名包后按当前 msix 重新注册。

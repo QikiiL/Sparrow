@@ -1,7 +1,7 @@
 {
-  "version": "1.1.1",
-  "notes": "1.1.1（原 2.1.1，版本号重编号）为缺陷修复版，包含 1.1.0 的全部云同步功能。\n修复在浏览器网页、微信聊天窗口等场景下，点击剪贴板条目时内容被粘贴到上一个软件的问题：粘贴目标现在会在点击时冻结，并在发送 Ctrl+V 前校验前台窗口；目标不明确时只复制，不再误粘。\n修复「粘贴后保持打开」开启时，开始连续粘贴仍会隐藏面板的问题；连续粘贴过程中面板保持显示，焦点交给目标输入框。\n修复连续粘贴快速连按 Ctrl+V 时可能漏掉一条的问题（改为 keydown/keyup 配对，不再使用 180ms 去抖）；连续粘贴结束后不再残留条目高亮。\n升级说明：直接覆盖安装即可，config/ 与 data/ 保留；无需重新配置云同步。",
-  "github": "https://github.com/QikiiL/Sparrow/releases/tag/v1.1.1",
+  "version": "1.1.2",
+  "notes": "1.1.2 为缺陷修复版。\n修复开机自启动在升级/多副本场景下失效：启动时不再无条件删除计划任务，只有确认任务属于当前程序时才删除；创建后回查校验，失败会明确提示并写入 config/autostart.log；设置页新增「系统启动项未注册」提示与「立即修复」。\n修复稀疏包身份被注册到调试目录后、安装版误判「已注册」导致开机弹「Windows 找不到 sms-helper.exe」的问题；现在会校验包根目录并在不一致时自动重注册。\n升级说明：直接覆盖安装即可，config/ 与 data/ 保留。",
+  "github": "https://github.com/QikiiL/Sparrow/releases/tag/v1.1.2",
   "lanzou": "https://wwbwp.lanzoul.com/b00ybd8mej",
   "lanzou_password": "bdlx"
 }

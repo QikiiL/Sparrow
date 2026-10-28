@@ -16,6 +16,9 @@ impl Default for CloseBehavior {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppSettings {
+    // 旧版 settings.json 缺该字段时不能让整份配置反序列化失败:
+    // 反序列化失败会让自启动同步误以为"用户关了自启动"
+    #[serde(default)]
     pub start_with_windows: bool,
     pub retention_days: i32,
     pub max_item_count: i32,
@@ -183,6 +186,16 @@ mod tests {
         assert!(!settings.sync.enabled);
         assert_eq!(settings.sync.root_prefix, "sparrow");
         assert_eq!(settings.sync.poll_interval_sec, 5);
+    }
+
+    /// 旧配置文件缺 start_with_windows 字段时不能整份反序列化失败
+    /// (失败会让调用方回落默认值,进而误判用户关掉了自启动)
+    #[test]
+    fn missing_start_with_windows_uses_default() {
+        let mut value = serde_json::to_value(AppSettings::default()).unwrap();
+        value.as_object_mut().unwrap().remove("start_with_windows");
+        let settings: AppSettings = serde_json::from_value(value).unwrap();
+        assert!(!settings.start_with_windows);
     }
 
     #[test]
