@@ -1,7 +1,7 @@
 {
-  "version": "1.1.2",
-  "notes": "1.1.2 为缺陷修复版。\n修复开机自启动在升级/多副本场景下失效：启动时不再无条件删除计划任务，只有确认任务属于当前程序时才删除；创建后回查校验，失败会明确提示并写入 config/autostart.log；设置页新增「系统启动项未注册」提示与「立即修复」。\n修复稀疏包身份被注册到调试目录后、安装版误判「已注册」导致开机弹「Windows 找不到 sms-helper.exe」的问题；现在会校验包根目录并在不一致时自动重注册。\n升级说明：直接覆盖安装即可，config/ 与 data/ 保留。",
-  "github": "https://github.com/QikiiL/Sparrow/releases/tag/v1.1.2",
+  "version": "1.1.3",
+  "notes": "1.1.3 为缺陷修复版。\n修复连续粘贴模式下框选条目时列表不会自动滚动的问题：鼠标移到列表上下边缘时会自动滚动跟随，滚动过程中持续更新选区，不再出现「选到哪一条看不见」的情况。\n升级说明：直接覆盖安装即可，config/ 与 data/ 保留。",
+  "github": "https://github.com/QikiiL/Sparrow/releases/tag/v1.1.3",
   "lanzou": "https://wwbwp.lanzoul.com/b00ybd8mej",
   "lanzou_password": "bdlx"
 }
