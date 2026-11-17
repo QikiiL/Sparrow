@@ -269,6 +269,19 @@ pub fn freeze_paste_target(captured: isize) -> Option<isize> {
             tracked_age_ms()
         );
     }
+    // release 版没有控制台,eprintln 的内容全部丢失 —— 同样的信息落一行
+    // paste.log:现场"点了没粘贴"时先看这一行,frozen=None 说明落点被拦下
+    // (本次退化成仅复制),source 说明落点取自跟踪器还是回退了捕获值
+    crate::utils::diag::log_paste(&format!(
+        "freeze captured={} frozen={} source={} age={}ms",
+        captured,
+        match frozen {
+            Some(h) => format!("Some({})", h),
+            None => "None".to_string(),
+        },
+        source,
+        tracked_age_ms()
+    ));
     frozen
 }
 

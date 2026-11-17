@@ -37,6 +37,19 @@ pub fn show_or_create(app: &AppHandle) {
                 crate::utils::input_focus::force_topmost(h.0 as isize);
             }
         }
+        // 已存在窗口的分支以前只 show()+set_focus():而唤出本应用时我们正是
+        // "非前台进程",那次 set_focus 常被 Windows 前台锁静默拒绝,窗口
+        // 可见但不是前台 —— 用户点第一下条目时点击根本没送到面板(表现为
+        // "第一次点不粘贴,第二次才粘")。这里补一次强夺取 + 与建窗路径一致
+        // 的异步兜底,保证面板真正拿到前台输入权。交接期间(正在把前台交给
+        // 粘贴落点)绝不抢,与 ensure_focus 的抑制语义一致
+        if let Ok(h) = window.hwnd() {
+            let hwnd = h.0 as isize;
+            if !crate::utils::input_focus::is_focus_handoff_active() {
+                crate::utils::input_focus::force_foreground(hwnd);
+            }
+        }
+        ensure_focus(window.clone());
         return;
     }
     spawn_create(app);
@@ -183,6 +196,16 @@ pub fn create_main_window(app: &AppHandle, show_when_ready: bool) -> tauri::Resu
                 // 置顶在 show 之后重申:创建线程落置顶与页面加载完成之间可能
                 // 隔数百毫秒,快速热键操作可在间隙里插入销毁/重建
                 apply_pinned(window.app_handle(), &window);
+                // 建窗路径同样受前台锁影响:热键唤出时我们不是前台进程,
+                // 紧邻的 set_focus 可能被静默拒绝(只闪任务栏)。先做一次
+                // AttachThreadInput 强夺取,拿到真正的前台输入权后再交给
+                // ensure_focus 做异步兜底
+                if let Ok(h) = window.hwnd() {
+                    let hwnd = h.0 as isize;
+                    if !crate::utils::input_focus::is_focus_handoff_active() {
+                        crate::utils::input_focus::force_foreground(hwnd);
+                    }
+                }
                 ensure_focus(window);
             }
         });
@@ -361,9 +384,9 @@ pub fn exit_app(app: &AppHandle) {
 /// tao 标志滞后);窗口期间被销毁则安静退出。
 ///
 /// 两处提前返回:
-/// - 已真正取得焦点(tao 标志或原生前台比对成立)—— 目标达成;
+/// - 已真正取得前台焦点(**只**认原生 `GetForegroundWindow` 比对)—— 目标达成;
 /// - [`input_focus::is_focus_handoff_active`] 为真 —— 应用正在把前台交给
-///   粘贴目标窗口(「粘贴后保持打开」),此时再 set_focus 会把焦点抢回面板,
+///   粘贴目标窗口(「粘贴后保持打开」),此时再抢前台会把焦点夺回面板,
 ///   随后模拟的 Ctrl+V 就落进面板自己的搜索框(表现为"点了没粘贴")。
 ///   正常路径下焦点已由 show()+set_focus() 给到,停手不影响聚焦。
 fn ensure_focus(window: tauri::WebviewWindow) {
@@ -373,9 +396,16 @@ fn ensure_focus(window: tauri::WebviewWindow) {
             if crate::utils::input_focus::is_focus_handoff_active() {
                 return;
             }
-            if window.is_focused().unwrap_or(false)
-                || crate::utils::input_focus::is_foreground_window(hwnd)
-            {
+            // 判定只用原生前台比对。这里**不能**再用 tao 的 window.is_focused():
+            // 它基于 WM_ACTIVATE/WM_SETFOCUS 异步更新,窗口刚显示时滞后,会把
+            // "可见但并非前台"误报成已聚焦 —— 循环随即提前退出,前台锁导致的
+            // 抢焦点失败再没人重试,用户点第一下条目就落空(第一次点击不粘贴)
+            if crate::utils::input_focus::is_foreground_window(hwnd) {
+                return;
+            }
+            // 每轮先尝试绕过前台锁的强夺取(AttachThreadInput + SetForegroundWindow),
+            // 它比 tao 的 set_focus 更可能成功;失败才退回 set_focus
+            if crate::utils::input_focus::force_foreground(hwnd) {
                 return;
             }
             let _ = window.set_focus();

@@ -238,6 +238,10 @@ pub async fn deliver_content(
             // 抢走/已关闭/前台仍是本面板)就不发按键 —— 剪贴板已写好,
             // 用户手动 Ctrl+V 仍然可用,绝不把内容粘进错误的软件
             if crate::utils::input_focus::wait_for_paste_target(target) {
+                crate::utils::diag::log_paste(&format!(
+                    "gate wait_for_paste_target target={} ok=true -> send Ctrl+V",
+                    target
+                ));
                 simulate_paste()?;
                 Ok(true)
             } else {
@@ -245,6 +249,11 @@ pub async fn deliver_content(
                     "[paste] foreground is not paste target {} — copy only (Ctrl+V not sent)",
                     target
                 );
+                // 闸门没过:前台不是落点,按键会打错窗口,只能降级仅复制
+                crate::utils::diag::log_paste(&format!(
+                    "gate wait_for_paste_target target={} ok=false -> copy only",
+                    target
+                ));
                 Ok(false)
             }
         } else {
@@ -375,6 +384,8 @@ pub fn freeze_target_from_state(app_handle: &tauri::AppHandle) -> Option<isize> 
     let captured = app_handle
         .state::<crate::utils::input_focus::PasteMode>()
         .target();
+    // 落点三态 + 来源的 paste.log 由 freeze_paste_target 自己落(它才知道
+    // source),这里不再重复打
     crate::utils::foreground_tracker::freeze_paste_target(captured)
 }
 
@@ -407,6 +418,22 @@ pub async fn deliver_item_by_id(
     do_paste: bool,
     suppress_ms: u64,
 ) -> Result<Delivery, String> {
+    // ⓪ 焦点交接抑制必须**在冻结之前**建立。
+    //    原先这段守卫建在 freeze 和一次数据库 await 之后,这期间
+    //    `window_manager::ensure_focus` 的 15×50ms 轮询仍在跑:它一旦在这段时间
+    //    里把前台抢回面板,刚冻结的落点就失效(随后 Ctrl+V 打回面板自己),
+    //    表现为"点了没粘贴/只复制"。守卫提前到函数入口即可覆盖
+    //    冻结 + 查询 + 隐藏/销毁 + 发送全过程。
+    //    `begin/end_focus_handoff` 是**布尔**标志(不是计数,见
+    //    utils::input_focus),所以全程**只能有一个**守卫:两个守卫的 Drop 会
+    //    在第一个离开作用域时就把抑制解除,提前放 ensure_focus 回来抢焦点。
+    //    仅复制(do_paste=false)与连续粘贴(AtTarget)不动焦点,不建守卫。
+    let _handoff = match handling {
+        FocusHandling::HideFirst | FocusHandling::KeepOpen if do_paste => {
+            Some(FocusHandoffGuard::new())
+        }
+        _ => None,
+    };
     // ① 冻结本次粘贴的落点 —— 必须在任何窗口隐藏/销毁/异步等待**之前**:
     //    用户点条目后前台已经是我们自己的面板,再也读不到他真正想去的地方。
     //    三态穿过调用方(见 foreground_tracker::freeze_paste_target):
@@ -440,16 +467,14 @@ pub async fn deliver_item_by_id(
 
     let (content, item_type, file_path, html_path, rtf_path) = match row {
         Some(row) => row,
-        None => return Ok(Delivery::Missing),
+        None => {
+            crate::utils::diag::log_paste(&format!("delivery id={} Missing (row gone)", id));
+            return Ok(Delivery::Missing);
+        }
     };
 
-    // 焦点交接抑制:作用域必须覆盖到 simulate_paste 之后(写剪贴板与随后的
-    // 等待仍在 ensure_focus 的重试窗口内),故守卫活到函数返回,由 Drop 统一
-    // 解除。AtTarget 不动焦点,无需抑制
-    let _handoff = match handling {
-        FocusHandling::HideFirst | FocusHandling::KeepOpen => Some(FocusHandoffGuard::new()),
-        FocusHandling::AtTarget => None,
-    };
+    // 焦点交接抑制已在本函数入口建立(见 ⓪),这里不能再建第二个守卫:
+    // 布尔标志下两个守卫的 Drop 会让抑制提前解除
     match handling {
         FocusHandling::HideFirst => {
             if do_paste {
@@ -462,12 +487,25 @@ pub async fn deliver_item_by_id(
                         "[paste] focus handoff to target {} failed — copy only",
                         target
                     );
+                    crate::utils::diag::log_paste(&format!(
+                        "handoff HideFirst target={} release=false do_paste=false (degrade copy-only)",
+                        target
+                    ));
                     do_paste = false;
+                } else {
+                    crate::utils::diag::log_paste(&format!(
+                        "handoff HideFirst target={} release=true do_paste=true",
+                        target
+                    ));
                 }
             } else {
                 // 「仅复制」/冻结不到落点:面板照旧关闭(保留"点一下有反应"的
                 // 观感),但**绝不**归还焦点 / SetForegroundWindow —— 否则
                 // "只复制"也会把前台切回唤出前的应用
+                crate::utils::diag::log_paste(&format!(
+                    "handoff HideFirst target={} destroy-only (do_paste=false)",
+                    target
+                ));
                 crate::utils::window_manager::destroy_main_window(app_handle);
             }
         }
@@ -476,6 +514,10 @@ pub async fn deliver_item_by_id(
             // 落到 refocus 的 Z 序兜底,否则"点了桌面"会变成"粘进随机窗口")
             if do_paste {
                 if refocus_target_keep_window(app_handle, target).await {
+                    crate::utils::diag::log_paste(&format!(
+                        "handoff KeepOpen target={} refocus=true do_paste=true",
+                        target
+                    ));
                     // 交接焦点后重申本窗口置顶(幂等,SWP_NOACTIVATE 不抢焦点):
                     // 目标窗口被激活时可能把面板压到后面,视觉上像"被盖住"
                     let our_hwnd = app_handle
@@ -491,11 +533,29 @@ pub async fn deliver_item_by_id(
                     // 改走销毁窗口的可靠路径 —— 窗口销毁后 Windows 隐式激活目标
                     // 窗口,内容一定能粘出去;该路径也失败才退回仅复制
                     eprintln!("[keep-open] no usable target — degrading to HideFirst path");
+                    crate::utils::diag::log_paste(&format!(
+                        "handoff KeepOpen target={} refocus=false -> HideFirst fallback",
+                        target
+                    ));
                     if !release_focus_to_target(app_handle, target).await {
                         eprintln!("[keep-open] HideFirst fallback failed too — copy only");
+                        crate::utils::diag::log_paste(&format!(
+                            "handoff KeepOpen fallback target={} release=false do_paste=false (degrade copy-only)",
+                            target
+                        ));
                         do_paste = false;
+                    } else {
+                        crate::utils::diag::log_paste(&format!(
+                            "handoff KeepOpen fallback target={} release=true do_paste=true",
+                            target
+                        ));
                     }
                 }
+            } else {
+                crate::utils::diag::log_paste(&format!(
+                    "handoff KeepOpen target={} no-focus-change (do_paste=false)",
+                    target
+                ));
             }
         }
         FocusHandling::AtTarget => {
@@ -544,7 +604,19 @@ pub async fn deliver_item_by_id(
 
     // 把"是否真的发了按键"带出去:连续粘贴据此决定要不要标记「已粘贴」
     // (以前一律当成功,UI 会显示"已粘贴 n/N"但实际只复制)
-    result.map(|pasted| Delivery::Delivered { pasted })
+    let delivery = result.map(|pasted| Delivery::Delivered { pasted });
+    // 最终结果落一行 paste.log:pasted=false = 只复制(闸门没过/交接失败),
+    // Err = 写剪贴板就失败了。现场"点了没粘贴"靠这一行区分是哪一类
+    crate::utils::diag::log_paste(&format!(
+        "delivery id={} {}",
+        id,
+        match &delivery {
+            Ok(Delivery::Delivered { pasted }) => format!("Delivered pasted={}", pasted),
+            Ok(Delivery::Missing) => "Missing".to_string(),
+            Err(e) => format!("Err={}", e),
+        }
+    ));
+    delivery
 }
 
 #[cfg(test)]

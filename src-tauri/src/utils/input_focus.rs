@@ -21,6 +21,15 @@ extern "system" {
         cy: i32,
         flags: u32,
     ) -> i32;
+    // 前台锁绕过(见 force_foreground)。三者都是 user32 的导出,
+    // 与本文件其它调用一致用裸 #[link] 声明,不额外开 windows crate feature
+    fn AttachThreadInput(id_attach: u32, id_attach_to: u32, attach: i32) -> i32;
+    fn GetWindowThreadProcessId(hwnd: isize, process_id: *mut u32) -> u32;
+}
+
+#[link(name = "kernel32")]
+extern "system" {
+    fn GetCurrentThreadId() -> u32;
 }
 
 const GW_HWNDNEXT: u32 = 2;
@@ -101,6 +110,55 @@ pub fn restore_target_focus(hwnd: isize) -> bool {
             }
             SetForegroundWindow(hwnd);
             std::thread::sleep(Duration::from_millis(20));
+        }
+        GetForegroundWindow() == hwnd
+    }
+}
+
+/// 强行把窗口拿到前台,**绕过 Windows 的前台锁**。
+///
+/// 背景:非前台进程直接调 `SetForegroundWindow` 会被系统静默拒绝(只让
+/// 任务栏图标闪一下,返回值不可信,焦点不动)。用户从别的应用按热键唤出
+/// 面板时,我们正是"非前台进程",于是 `show()` + `set_focus()` 常常只让
+/// 面板**可见而非前台** —— 表现为唤出后点第一下条目没有任何反应(点击落在
+/// 没有激活的面板上,前端拿不到这次点击),点第二下才生效。
+///
+/// 标准解法:临时把本线程的输入状态挂到**当前前台窗口所属线程**上
+/// (`AttachThreadInput`),两线程共享输入队列后本进程在系统眼里就"拥有"
+/// 前台输入权,此时 `SetForegroundWindow` 才会被接受;取完立刻 detach,
+/// 绝不长期占用别的进程的输入队列。
+///
+/// 返回窗口最终是否真的成为前台(`GetForegroundWindow() == hwnd`)——
+/// 调用方据此决定要不要退回 `set_focus` 重试。
+pub fn force_foreground(hwnd: isize) -> bool {
+    if hwnd == 0 {
+        return false;
+    }
+    unsafe {
+        if GetForegroundWindow() == hwnd {
+            return true;
+        }
+        // 最小化窗口不先还原:SetForegroundWindow 只会闪任务栏,焦点不落地
+        if IsIconic(hwnd) != 0 {
+            ShowWindow(hwnd, SW_RESTORE);
+        }
+        let foreground = GetForegroundWindow();
+        let mut pid: u32 = 0;
+        let foreground_thread = if foreground != 0 {
+            GetWindowThreadProcessId(foreground, &mut pid)
+        } else {
+            0
+        };
+        let my_thread = GetCurrentThreadId();
+        // 已经在前台线程里(极少见)就没必要 attach
+        let attached = foreground_thread != 0
+            && foreground_thread != my_thread
+            && AttachThreadInput(my_thread, foreground_thread, 1) != 0;
+        SetForegroundWindow(hwnd);
+        // 无论 SetForegroundWindow 成败都必须 detach:残留的输入队列挂接会
+        // 让本线程被别的进程的输入状态牵制(对方阻塞时我方也收不到输入)
+        if attached {
+            AttachThreadInput(my_thread, foreground_thread, 0);
         }
         GetForegroundWindow() == hwnd
     }
@@ -234,5 +292,13 @@ mod tests {
 
         end_focus_handoff();
         assert!(!is_focus_handoff_active(), "end 后应恢复未抑制");
+    }
+
+    /// 空句柄守卫:force_foreground(0) 必须直接返回 false,不发任何 Win32
+    /// 调用(拿不到 hwnd 的路径不能误发 AttachThreadInput/SetForegroundWindow)
+    #[test]
+    fn force_foreground_rejects_null_hwnd() {
+        assert!(!force_foreground(0));
+        assert!(!is_foreground_window(0));
     }
 }

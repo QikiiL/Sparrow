@@ -26,6 +26,16 @@ pub async fn activate_item(
             crate::services::paste_service::FocusHandling::HideFirst
         };
 
+    // 诊断(现场排障的关键一行):用户点条目后**前端 invoke 是否真的送达
+    // Rust**。反馈"第一下点了没反应"时,若 paste.log 里没有这一行,说明
+    // 点击压根没到命令层(面板当时不是前台/被别的窗口盖住),与粘贴逻辑无关
+    crate::utils::diag::log_paste(&format!(
+        "activate id={} do_paste={} handling={}",
+        id,
+        do_paste,
+        handling_name(&handling)
+    ));
+
     // 窗口销毁/焦点归还/监听抑制/模拟按键/更新使用时间,全部在共享核心里
     // (与连续粘贴同一条投递路径,行为不会分叉)
     match crate::services::paste_service::deliver_item_by_id(
@@ -37,6 +47,16 @@ pub async fn activate_item(
         // 内容在剪贴板里,用户可以手动 Ctrl+V
         crate::services::paste_service::Delivery::Delivered { .. } => Ok(()),
         crate::services::paste_service::Delivery::Missing => Err("Item not found".to_string()),
+    }
+}
+
+/// 诊断日志用的处理方式名字(枚举没实现 Debug,这里显式映射)
+fn handling_name(handling: &crate::services::paste_service::FocusHandling) -> &'static str {
+    use crate::services::paste_service::FocusHandling;
+    match handling {
+        FocusHandling::HideFirst => "HideFirst",
+        FocusHandling::KeepOpen => "KeepOpen",
+        FocusHandling::AtTarget => "AtTarget",
     }
 }
 
