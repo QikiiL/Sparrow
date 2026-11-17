@@ -681,6 +681,32 @@ Section Install
 
   !insertmacro CheckIfAppIsRunning "${MAINBINARYNAME}.exe" "${PRODUCTNAME}"
 
+  ; 结束进程与实际释放文件句柄之间有滞后:进程映像销毁、杀软(火绒等)扫描
+  ; 都可能短暂持有 sparrow.exe,此时 File 覆盖会弹「无法打开要写入的文件」
+  ; 并中止整个安装(v1.1.3 实测)。这里先探测目标 exe 是否可写,最多等 6 秒
+  ; (20 × 300ms);仍失败再给用户明确指引,而不是直接甩一句系统错误。
+  Push $R9
+  Push $R8
+  retry_exe_writable:
+    StrCpy $R9 0
+  wait_exe_writable:
+    ClearErrors
+    FileOpen $R8 "$INSTDIR\${MAINBINARYNAME}.exe" a
+    ${If} ${Errors}
+      Sleep 300
+      IntOp $R9 $R9 + 1
+      ${If} $R9 >= 20
+        MessageBox MB_RETRYCANCEL|MB_ICONEXCLAMATION "无法写入 $\"$INSTDIR\${MAINBINARYNAME}.exe$\"。$\n$\n请从系统托盘右键退出剪雀(或在任务管理器中结束 sparrow.exe)后点击「重试」。$\n$\n若仍失败,可能是安全软件正在扫描该文件,稍等片刻再试。" IDRETRY retry_exe_writable
+        Pop $R8
+        Pop $R9
+        Abort "无法写入主程序文件"
+      ${EndIf}
+      Goto wait_exe_writable
+    ${EndIf}
+    FileClose $R8
+  Pop $R8
+  Pop $R9
+
   ; Copy main executable
   File "${MAINBINARYSRCPATH}"
 
