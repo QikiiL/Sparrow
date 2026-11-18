@@ -251,27 +251,22 @@ pub fn clear() {
 /// 变成我们自己的面板,再也读不到用户真正想去的地方了。
 pub fn freeze_paste_target(captured: isize) -> Option<isize> {
     let tracked = tracked_foreground();
-    let frozen = choose_paste_target(tracked, captured, is_valid_target);
-    let source = match (tracked, frozen) {
-        (TrackedForeground::Window(hwnd), Some(target)) if hwnd == target => "tracker",
-        (TrackedForeground::Window(_), _) => "tracker-stale",
-        (TrackedForeground::NoTarget, _) => "no-target",
-        (TrackedForeground::Unknown, Some(_)) => "unknown->captured",
-        (TrackedForeground::Unknown, None) => "unknown->none",
-    };
-    // tracker 命中是常态(不打日志);其余来源各打一行,便于现场排障
-    if source != "tracker" {
+    // 只读一次:choose_paste_target 的新鲜度判定与下面两处日志必须看到同一个
+    // 年龄,否则"判定用 1999ms、日志打 2003ms"这种漂移会让现场排障自相矛盾
+    let age = tracked_age_ms();
+    let (frozen, source) = choose_paste_target_with_source(tracked, captured, age, is_valid_target);
+    // 跟踪器新鲜命中是常态(不打日志);其余来源各打一行,便于现场排障
+    if source != SOURCE_TRACKER_FRESH {
         eprintln!(
             "[focus] paste target captured={} -> {:?} (source={}, age={}ms)",
-            captured,
-            frozen,
-            source,
-            tracked_age_ms()
+            captured, frozen, source, age
         );
     }
     // release 版没有控制台,eprintln 的内容全部丢失 —— 同样的信息落一行
     // paste.log:现场"点了没粘贴"时先看这一行,frozen=None 说明落点被拦下
-    // (本次退化成仅复制),source 说明落点取自跟踪器还是回退了捕获值
+    // (本次退化成仅复制);source 说明落点取自哪里:
+    // tracker-fresh(跟踪器新鲜)/ captured(唤出瞬间捕获值)/
+    // tracker-stale(陈旧跟踪记录兜底)/ no-target / unknown->none
     crate::utils::diag::log_paste(&format!(
         "freeze captured={} frozen={} source={} age={}ms",
         captured,
@@ -280,7 +275,7 @@ pub fn freeze_paste_target(captured: isize) -> Option<isize> {
             None => "None".to_string(),
         },
         source,
-        tracked_age_ms()
+        age
     ));
     frozen
 }
@@ -295,28 +290,81 @@ fn tracked_age_ms() -> u64 {
     unsafe { GetTickCount64() }.saturating_sub(tick)
 }
 
-/// 目标选择优先级(纯逻辑,可单测):
-/// 1. `Window(h)` 且通过 `valid` 校验 → `Some(h)`(用户最后真正在用的外部窗口);
-/// 2. `NoTarget`,或 `Window(h)` 已失效 → `None`(只复制)。这两种情况都表示
-///    "最近的前台不可能是粘贴目标"(点了桌面/任务栏/窗口已关闭),回退到
-///    `captured` 会把几分钟前的应用重新拉回前台 —— 正是本 bug 的症状;
-/// 3. `Unknown`(冷启动,从未收到前台事件):`captured == 0` → `Some(0)`
-///    (托盘/命令打开,允许走 Z 序兜底/隐式激活的老路径);
-///    `captured` 可用 → `Some(captured)`;`captured` 也不可用 → `None`。
+/// 跟踪器记录被视为"新鲜"的年龄上限。
+///
+/// 语义:唤出面板之后用户又切过窗口,2 秒内的记录才算"最新的意图";
+/// 超过 2 秒的记录只是历史(用户可能早就切走了),不能压过唤出瞬间捕获到的
+/// 真实前台。真机日志里 12.8 秒前的记录把内容粘进了旧窗口,正是缺这个上限。
+const TRACKER_FRESH_MS: u64 = 2_000;
+
+/// [`choose_paste_target_with_source`] 的来源标签(落 eprintln / paste.log)
+const SOURCE_TRACKER_FRESH: &str = "tracker-fresh";
+const SOURCE_CAPTURED: &str = "captured";
+const SOURCE_TRACKER_STALE: &str = "tracker-stale";
+const SOURCE_NO_TARGET: &str = "no-target";
+const SOURCE_UNKNOWN_NONE: &str = "unknown->none";
+
+/// 目标选择优先级(纯逻辑,可单测),只取结果、丢掉诊断来源。
+///
+/// 生产路径走 [`choose_paste_target_with_source`](它还要拿到 source 打日志),
+/// 这里保留只返回 `Option` 的入口给单测与排障:优先级规则本身只在一处实现,
+/// 不会出现"测的是一套、跑的是另一套"。
+#[cfg_attr(not(test), allow(dead_code))] // 仅单测/排障使用,生产走 with_source
 pub fn choose_paste_target<F>(
     tracked: TrackedForeground,
     captured: isize,
+    tracked_age_ms: u64,
     valid: F,
 ) -> Option<isize>
 where
     F: Fn(isize) -> bool,
 {
+    choose_paste_target_with_source(tracked, captured, tracked_age_ms, valid).0
+}
+
+/// 目标选择优先级 + 来源(纯逻辑,可单测)。判定顺序:
+///
+/// 1. **跟踪器新鲜**(`tracked_age_ms <= TRACKER_FRESH_MS`):`Window(h)` 且
+///    `h > 0` 且 `valid(h)` → `Some(h)`。语义:唤出之后用户又切过窗口(2 秒内),
+///    以最新的为准。
+/// 2. **否则用 `captured`**:`captured > 0 && valid(captured)` → `Some(captured)`。
+///    语义:唤出瞬间的前台就是用户真正想粘的地方;跟踪器可能过期(`NoTarget`
+///    误清空,或记录是十几秒前的旧窗口)。
+/// 3. **回退原语义**(`captured` 不可用时才用陈旧记录):
+///    `Window(h)` 且 `valid(h)` → `Some(h)`;`Window(_)` / `NoTarget` → `None`
+///    (只复制);`Unknown` + `captured == 0` → `Some(0)`(托盘/冷启动,允许
+///    Z 序兜底/隐式激活的老路径);其余 `Unknown` → `None`。
+fn choose_paste_target_with_source<F>(
+    tracked: TrackedForeground,
+    captured: isize,
+    tracked_age_ms: u64,
+    valid: F,
+) -> (Option<isize>, &'static str)
+where
+    F: Fn(isize) -> bool,
+{
+    // ① 跟踪器新鲜 → 以跟踪器为准(唤出后用户又切过窗口)
+    if tracked_age_ms <= TRACKER_FRESH_MS {
+        if let TrackedForeground::Window(hwnd) = tracked {
+            if hwnd > 0 && valid(hwnd) {
+                return (Some(hwnd), SOURCE_TRACKER_FRESH);
+            }
+        }
+    }
+    // ② 唤出瞬间捕获到的真实前台 → 用它(跟踪器过期/误清空都不再压过它)
+    if captured > 0 && valid(captured) {
+        return (Some(captured), SOURCE_CAPTURED);
+    }
+    // ③ captured 也不可用,才退回原语义(可能用到陈旧记录)
     match tracked {
-        TrackedForeground::Window(hwnd) if hwnd > 0 && valid(hwnd) => Some(hwnd),
-        TrackedForeground::Window(_) | TrackedForeground::NoTarget => None,
-        TrackedForeground::Unknown if captured == 0 => Some(0),
-        TrackedForeground::Unknown if captured > 0 && valid(captured) => Some(captured),
-        TrackedForeground::Unknown => None,
+        TrackedForeground::Window(hwnd) if hwnd > 0 && valid(hwnd) => {
+            (Some(hwnd), SOURCE_TRACKER_STALE)
+        }
+        TrackedForeground::Window(_) | TrackedForeground::NoTarget => (None, SOURCE_NO_TARGET),
+        // 冷启动/托盘:既无记录也无捕获值 → Some(0) 允许老路径兜底。
+        // 来源沿用原来的 unknown->captured 语义,归并进 captured 一族
+        TrackedForeground::Unknown if captured == 0 => (Some(0), SOURCE_CAPTURED),
+        TrackedForeground::Unknown => (None, SOURCE_UNKNOWN_NONE),
     }
 }
 
@@ -858,14 +906,19 @@ mod tests {
         );
     }
 
-    // ---------- 目标选择优先级(三态 → Option,纯逻辑) ----------
+    // ---------- 目标选择优先级(三态 + 新鲜度 → Option,纯逻辑) ----------
 
-    /// Unknown(冷启动)+ 有有效捕获值 → 回退捕获值(旧行为)
+    /// Unknown(冷启动)+ 有有效捕获值 → 回退捕获值(旧行为,与年龄无关)
     #[test]
     fn unknown_falls_back_to_captured() {
         assert_eq!(
-            choose_paste_target(TrackedForeground::Unknown, 0xA, |_| true),
+            choose_paste_target(TrackedForeground::Unknown, 0xA, 0, |_| true),
             Some(0xA)
+        );
+        assert_eq!(
+            choose_paste_target(TrackedForeground::Unknown, 0xA, 60_000, |_| true),
+            Some(0xA),
+            "Unknown 没有记录,年龄无从谈起,捕获值照用"
         );
     }
 
@@ -873,9 +926,14 @@ mod tests {
     #[test]
     fn unknown_without_capture_yields_zero_for_fallbacks() {
         assert_eq!(
-            choose_paste_target(TrackedForeground::Unknown, 0, |_| true),
+            choose_paste_target(TrackedForeground::Unknown, 0, 0, |_| true),
             Some(0),
             "托盘/冷启动没有记录时,老路径(Z 序兜底/隐式激活)必须保留"
+        );
+        assert_eq!(
+            choose_paste_target(TrackedForeground::Unknown, 0, 60_000, |_| true),
+            Some(0),
+            "陈旧年龄不能把 Some(0) 老路径变成 None"
         );
     }
 
@@ -883,32 +941,43 @@ mod tests {
     #[test]
     fn unknown_with_invalid_capture_yields_none() {
         assert_eq!(
-            choose_paste_target(TrackedForeground::Unknown, 0xA, |_| false),
+            choose_paste_target(TrackedForeground::Unknown, 0xA, 0, |_| false),
+            None
+        );
+        assert_eq!(
+            choose_paste_target(TrackedForeground::Unknown, 0xA, 60_000, |_| false),
             None
         );
     }
 
-    /// NoTarget(点了桌面/任务栏)→ None = 只复制,**不得**回退 captured,
-    /// 也不得退化成 Some(0) 让 KeepOpen 的 Z 序兜底去粘随机窗口
+    /// NoTarget(点了桌面/任务栏)+ 捕获值可用 → **用捕获值**(1.1.3 起的行为):
+    /// 捕获值就是唤出瞬间的真实前台,不再因为跟踪器误清空而退化成"只复制"。
+    /// 只有捕获值也不可用时才 None = 只复制,且不得退化成 Some(0) 让 KeepOpen
+    /// 的 Z 序兜底去粘随机窗口。
     #[test]
-    fn no_target_yields_none() {
+    fn no_target_uses_captured_or_copy_only() {
         assert_eq!(
-            choose_paste_target(TrackedForeground::NoTarget, 0xA, |_| true),
-            None,
-            "点完桌面再点条目,不能把唤出前的旧应用拉回前台"
+            choose_paste_target(TrackedForeground::NoTarget, 0xA, 0, |_| true),
+            Some(0xA),
+            "跟踪器 NoTarget 不能压过唤出瞬间捕获到的真实前台(详见 captured_wins_over_no_target)"
         );
         assert_eq!(
-            choose_paste_target(TrackedForeground::NoTarget, 0, |_| true),
+            choose_paste_target(TrackedForeground::NoTarget, 0xA, 0, |_| false),
+            None,
+            "捕获值也不可用时,不能把唤出前的旧应用拉回前台"
+        );
+        assert_eq!(
+            choose_paste_target(TrackedForeground::NoTarget, 0, 0, |_| true),
             None,
             "也不能退化成 Some(0) 走 Z 序兜底"
         );
     }
 
-    /// Window(可用)→ 用它(而不是唤出时捕获的旧目标)
+    /// Window(可用)且记录新鲜 → 用它(而不是唤出时捕获的旧目标)
     #[test]
     fn prefer_tracked_window() {
         assert_eq!(
-            choose_paste_target(TrackedForeground::Window(0xB), 0xA, |_| true),
+            choose_paste_target(TrackedForeground::Window(0xB), 0xA, 800, |_| true),
             Some(0xB),
             "用户在面板打开后切到另一个应用,落点应是那个应用"
         );
@@ -918,7 +987,7 @@ mod tests {
     #[test]
     fn stale_tracked_window_yields_none() {
         assert_eq!(
-            choose_paste_target(TrackedForeground::Window(0xB), 0xA, |_| false),
+            choose_paste_target(TrackedForeground::Window(0xB), 0xA, 800, |_| false),
             None,
             "记录里的窗口已关闭时,不能回退到陈旧的捕获值"
         );
@@ -928,8 +997,86 @@ mod tests {
     #[test]
     fn zero_tracked_value_is_not_a_target() {
         assert_eq!(
-            choose_paste_target(TrackedForeground::Window(0), 0xA, |h| h == 0),
+            choose_paste_target(TrackedForeground::Window(0), 0xA, 0, |h| h == 0),
             None
+        );
+    }
+
+    // ---------- 回归:真机日志暴露的两个落点 bug ----------
+
+    /// 真机日志 07:18:38 `freeze captured=527294 frozen=None source=no-target`
+    /// → 第一次点击只复制没粘贴。跟踪器 NoTarget 时,捕获值仍然可用,必须用它。
+    #[test]
+    fn captured_wins_over_no_target() {
+        assert_eq!(
+            choose_paste_target(TrackedForeground::NoTarget, 527294, 0, |_| true),
+            Some(527294),
+            "NoTarget 不能再无条件压过唤出瞬间捕获到的前台"
+        );
+    }
+
+    /// 真机日志 07:19:31 `source=tracker age=12828ms` → 内容粘进了 12 秒前的
+    /// 旧窗口 461624,而用户实际在浏览器 527294。陈旧记录不得压过捕获值。
+    #[test]
+    fn stale_tracker_does_not_override_captured() {
+        assert_eq!(
+            choose_paste_target(TrackedForeground::Window(461624), 527294, 12_828, |_| true),
+            Some(527294),
+            "超过 TRACKER_FRESH_MS 的跟踪记录只是历史,不能覆盖捕获值"
+        );
+    }
+
+    /// 唤出之后用户又切过窗口(800ms 前)→ 跟最新的那个,捕获值让位
+    #[test]
+    fn fresh_tracker_wins_after_user_switches() {
+        assert_eq!(
+            choose_paste_target(TrackedForeground::Window(461624), 527294, 800, |_| true),
+            Some(461624),
+            "新鲜记录代表用户最新意图,应压过唤出瞬间的捕获值"
+        );
+    }
+
+    /// 捕获值不可用(0/已关闭)→ 才回退到陈旧跟踪记录
+    #[test]
+    fn captured_invalid_falls_back_to_stale_tracker() {
+        assert_eq!(
+            choose_paste_target(TrackedForeground::Window(461624), 0, 60_000, |_| true),
+            Some(461624),
+            "捕获值为 0 时,陈旧记录仍比 Some(0) 兜底更准"
+        );
+    }
+
+    /// 既无捕获值又 NoTarget → None = 只复制(不能退化成 Some(0) 粘随机窗口)
+    #[test]
+    fn no_target_and_invalid_captured_is_copy_only() {
+        assert_eq!(
+            choose_paste_target(TrackedForeground::NoTarget, 0, 0, |_| true),
+            None
+        );
+    }
+
+    /// 来源标签与优先级一致(诊断日志可读性)
+    #[test]
+    fn source_labels_follow_priority() {
+        assert_eq!(
+            choose_paste_target_with_source(TrackedForeground::Window(0xB), 0xA, 800, |_| true),
+            (Some(0xB), SOURCE_TRACKER_FRESH)
+        );
+        assert_eq!(
+            choose_paste_target_with_source(TrackedForeground::Window(0xB), 0xA, 60_000, |_| true),
+            (Some(0xA), SOURCE_CAPTURED)
+        );
+        assert_eq!(
+            choose_paste_target_with_source(TrackedForeground::Window(0xB), 0, 60_000, |_| true),
+            (Some(0xB), SOURCE_TRACKER_STALE)
+        );
+        assert_eq!(
+            choose_paste_target_with_source(TrackedForeground::NoTarget, 0xA, 0, |_| false),
+            (None, SOURCE_NO_TARGET)
+        );
+        assert_eq!(
+            choose_paste_target_with_source(TrackedForeground::Unknown, 0xA, 0, |_| false),
+            (None, SOURCE_UNKNOWN_NONE)
         );
     }
 
